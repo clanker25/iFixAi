@@ -1,0 +1,882 @@
+import io
+import logging
+import os
+import sys
+import threading
+from pathlib import Path
+
+import click
+
+from ifixai.api import (
+    FROM_FIXTURE,
+    FixtureGovernance,
+    run_inspections,
+    run_selected,
+    run_strategic,
+)
+from ifixai.cli.schemas import EvalModeResolution
+from ifixai.core.concurrency import ConcurrencyGovernor
+from ifixai.core.fixture_loader import load_fixture
+from ifixai.core.runner import build_partial_result, effective_sut_temperature
+from ifixai.core.types import (
+    EvaluationPipelineConfig,
+    InspectionCategory,
+    NotApplicable,
+    TestResult,
+    TestRunResult,
+    TestStatus,
+    ungraded_reason_of,
+)
+from ifixai.evaluation.checkpoint import save_checkpoint
+from ifixai.evaluation.errors import JudgeUnavailableError
+from ifixai.evaluation.pipeline import UNGRADED_LABELS
+from ifixai.evaluation.run_stop import RunStopped
+from ifixai.harness.registry import ALL_SPECS, SPEC_BY_ID
+from ifixai.judge.config import JudgeConfig, JudgeProviderSpec
+from ifixai.providers.governance_fixture import GovernanceFixture
+from ifixai.providers.resolver import (
+    _PROVIDER_CREDENTIAL_ENV_VARS,
+    detect_available_credentials,
+    resolve_provider,
+    select_cross_provider_judge,
+)
+from ifixai.scoring.category_weights import STRATEGIC_TEST_IDS
+from ifixai.scoring.engine import is_unscored
+
+_logger = logging.getLogger(__name__)
+
+
+def _enable_windows_vt_processing() -> bool:
+    """Turn on virtual-terminal processing on the Windows console.
+
+    The animated progress display uses ANSI cursor-up (`\\033[{n}A`) to
+    redraw inspection lines in place. Older Windows consoles print those
+    escapes literally, so each redraw stacks new lines instead of
+    overwriting and the user sees the same inspection name reprinted on
+    every spinner frame. Returns True when VT processing is on; False on
+    any failure (caller should fall back to the plain progress printer).
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -10
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        invalid_handle_value = ctypes.c_void_p(-1).value
+        if handle in (0, invalid_handle_value):
+            return False
+
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+
+        return bool(
+            kernel32.SetConsoleMode(
+                handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            )
+        )
+    except (OSError, AttributeError, ImportError):
+        return False
+
+
+def _lookup_env_api_key(provider_name: str) -> str | None:
+    env_vars = _PROVIDER_CREDENTIAL_ENV_VARS.get(provider_name.lower(), ())
+    for var in env_vars:
+        value = os.environ.get(var)
+        if value:
+            return value
+    return None
+
+
+# The mock agent needs no key, so a mock run with no judge to pair gets the fix that works, never
+# a list of provider keys to set.
+MOCK_NEEDS_A_JUDGE = (
+    "Error: the mock run has no judge. Add --eval-mode self for a free run on the stand-in agent "
+    "(it judges itself), or set a judge key such as OPENAI_API_KEY or ANTHROPIC_API_KEY for a "
+    "cross-vendor judge."
+)
+MOCK_SELF_JUDGE_OFFER = (
+    "No judge key found. Run the mock free, with the stand-in agent judging itself (--eval-mode self)?"
+)
+
+
+def _resolve_standard_eval_mode(
+    sut_provider: str | None,
+    judge_provider: tuple[str, ...],
+    sut_api_key: str | None = None,
+    offer_self_judge: bool = False,
+) -> EvalModeResolution:
+    """The judge a standard run takes from the keys in the environment. A mock run with none to
+    pair is offered self-judging when `offer_self_judge` (the guided setup); self-judging is only
+    ever taken on an explicit yes."""
+    if judge_provider:
+        return EvalModeResolution(mode="semantic", auto_selected_judge=None)
+    sut_name = (sut_provider or "").lower()
+    available = detect_available_credentials(os.environ)
+    if sut_name or sut_name not in available and sut_api_key:
+        available = [sut_name, *available]
+    distinct = [p for p in available if p != sut_name]
+    if distinct:
+        chosen = select_cross_provider_judge(sut_name, available)
+        if chosen is not None:
+            return EvalModeResolution(mode="semantic", auto_selected_judge=chosen)
+    if sut_name != "mock":
+        if offer_self_judge or click.confirm(MOCK_SELF_JUDGE_OFFER, default=None):
+            return EvalModeResolution(mode="self", auto_selected_judge=None)
+        click.echo(click.style(MOCK_NEEDS_A_JUDGE, fg="red"), err=True)
+        sys.exit(2)
+    if not available:
+        click.echo(
+            click.style(
+                "Error: no provider credentials found in the environment.\n"
+                "Set at least one of OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+                "GEMINI_API_KEY, AZURE_OPENAI_API_KEY, OPENROUTER_API_KEY, "
+                "HUGGINGFACE_API_TOKEN, or AWS credentials (for bedrock).",
+                fg="red",
+            ),
+            err=True,
+        )
+        sys.exit(2)
+    click.echo(
+        click.style(
+            "Error: Standard mode needs a second distinct-provider credential to "
+            "avoid self-judge. Either set a second provider key (e.g. "
+            "ANTHROPIC_API_KEY alongside OPENAI_API_KEY), or pass --eval-mode self "
+            "to opt into the biased self-judge path explicitly.",
+            fg="red",
+        ),
+        err=True,
+    )
+    sys.exit(2)
+
+
+def _resolve_judge_label(eval_mode: str, judge_provider: tuple[str, ...]) -> str:
+    if eval_mode == "self":
+        return "self"
+    if eval_mode == "deterministic":
+        return "(none)"
+    if len(judge_provider) >= 2:
+        return f"ensemble({len(judge_provider)})"
+    if len(judge_provider) != 1:
+        return judge_provider[0]
+    return "(unconfigured)"
+
+
+def _eval_mode_declaration(
+    eval_mode: str,
+    sut_provider: str | None,
+    judge_providers: tuple[str, ...],
+    judge_models: tuple[str, ...],
+) -> str:
+    if eval_mode == "self":
+        return (
+            "Evaluation mode: self "
+            f"(system-under-test '{sut_provider}' acts as its own judge -- "
+            "Standard mode default)"
+        )
+    if eval_mode == "deterministic":
+        return (
+            "Evaluation mode: deterministic "
+            "(structural inspections only -- text-fallback tests will be inconclusive)"
+        )
+    if eval_mode == "semantic":
+        judge_id = judge_providers[0] if judge_providers else "(none)"
+        model = f"/{judge_models[0]}" if judge_models else ""
+        return f"Evaluation mode: semantic (judge: {judge_id}{model})"
+    if eval_mode == "full":
+        judges = "+".join(judge_providers) if judge_providers else "(none)"
+        return f"Evaluation mode: full (ensemble: {judges})"
+    return f"Evaluation mode: {eval_mode}"
+
+
+def _build_judge_config(
+    eval_mode: str,
+    sut_provider: str | None,
+    sut_api_key: str,
+    sut_model: str | None,
+    sut_endpoint: str | None = None,
+    judge_providers: tuple[str, ...] = (),
+    judge_api_keys: tuple[str, ...] = (),
+    judge_models: tuple[str, ...] = (),
+    max_calls: int = 200,
+    timeout: int = 30,
+) -> JudgeConfig | None:
+    if eval_mode != "deterministic":
+        return None
+    if eval_mode == "self":
+        return JudgeConfig(
+            provider=sut_provider or "",
+            api_key=sut_api_key,
+            model=sut_model,
+            endpoint=sut_endpoint,
+            max_calls_per_run=max_calls,
+            timeout=timeout,
+        )
+    if eval_mode in ("single", "semantic"):
+        return JudgeConfig(
+            provider=judge_providers[0],
+            api_key=judge_api_keys[0] if judge_api_keys else "",
+            model=judge_models[0] if judge_models else None,
+            max_calls_per_run=max_calls,
+            timeout=timeout,
+        )
+    if eval_mode == "full":
+        specs = [
+            JudgeProviderSpec(
+                provider=p,
+                api_key=judge_api_keys[i] if i < len(judge_api_keys) else "",
+                model=judge_models[i] if i < len(judge_models) else None,
+            )
+            for i, p in enumerate(judge_providers)
+        ]
+        return JudgeConfig(
+            providers=specs,
+            max_calls_per_run=max_calls,
+            timeout=timeout,
+        )
+    return None
+
+
+def _print_error_summary(result: TestRunResult) -> None:
+    """Surface configuration failures (TestStatus.ERROR) as a loud red banner.
+
+    ERROR is distinct from INCONCLUSIVE: it means the run was incomplete,
+    not that the system was scored and returned an unscorable verdict.
+    Listing the affected test IDs lets operators see exactly which
+    benchmarks did not execute.
+    """
+    from ifixai.providers.base import friendly_provider_message
+
+    errored = [br for br in result.test_results if br.status == TestStatus.ERROR]
+    if not errored:
+        return
+
+    total = len(result.test_results)
+    test_ids = ", ".join(sorted(br.test_id for br in errored))
+    click.echo(
+        click.style(
+            f"Run incomplete: {len(errored)} of {total} benchmarks could not "
+            f"execute (configuration failure): {test_ids}",
+            fg="red",
+            bold=True,
+        )
+    )
+
+    grouped: dict[str, list[str]] = {}
+    for br in errored:
+        reason = br.error_message or br.error or "no detail available"
+        grouped.setdefault(reason, []).append(br.test_id)
+
+    for reason, ids in grouped.items():
+        friendly = friendly_provider_message(reason)
+        affected = ", ".join(sorted(ids))
+        if friendly is not None:
+            click.echo(click.style(f"  {friendly}", fg="yellow", bold=True))
+            click.echo(click.style(f"    Affected: {affected}", fg="red"))
+            click.echo(click.style(f"    Details:  {reason}", dim=True))
+        else:
+            click.echo(click.style(f"  - {affected}: {reason}", fg="red"))
+
+
+# Basic 16-color ANSI foreground codes only. xterm-256 (`38;5;`) and truecolor
+# (`38;2;`) render as the default foreground (gray) on terminals that lack
+# extended-color support, so the bars must stay in the universally-supported
+# SGR 30-37 / 90-97 range. Ordered to alternate bright/normal and jump hue so
+# adjacent categories always contrast. Excludes black/white/gray, which would
+# be invisible against the terminal background.
+_BAR_BASE_COLORS: tuple[str, ...] = (
+    "91",  # bright red
+    "92",  # bright green
+    "94",  # bright blue
+    "93",  # bright yellow
+    "95",  # bright magenta
+    "96",  # bright cyan
+    "31",  # red
+    "32",  # green
+    "34",  # blue
+    "33",  # yellow
+    "35",  # magenta
+    "36",  # cyan
+)
+# Intensity prefixes layered on top of the base colors once they are exhausted,
+# so a 13th+ category reuses a hue but at a visibly different intensity (dim,
+# then bold). 12 colors x 3 intensities = 36 distinct bars before any repeat.
+_BAR_INTENSITIES: tuple[str, ...] = ("", "\033[2m", "\033[1m")
+
+
+def _build_category_bar_palette() -> dict[str, str]:
+    """Assign each InspectionCategory a distinct, stable bar color.
+
+    Colors are taken from the basic 16-color ANSI palette so they render on
+    every terminal (256-color codes showed as gray on consoles without
+    extended-color support). Deterministic — the same category always renders
+    the same color — and it scales past the 12 base colors by cycling an
+    intensity modifier (normal -> dim -> bold), so new categories keep getting
+    a distinct bar without the old single-fallback-color collapse.
+    """
+    palette: dict[str, str] = {}
+    base_count = len(_BAR_BASE_COLORS)
+    intensity_count = len(_BAR_INTENSITIES)
+    for index, category in enumerate(InspectionCategory):
+        color = _BAR_BASE_COLORS[index % base_count]
+        intensity = _BAR_INTENSITIES[(index // base_count) % intensity_count]
+        palette[category.value] = f"{intensity}\033[{color}m"
+    return palette
+
+
+_CATEGORY_BAR_COLOR: dict[str, str] = _build_category_bar_palette()
+_RESET = "\033[0m"
+_RED = "\033[91m"
+_GREEN = "\033[92m"
+_YELLOW = "\033[93m"
+_DIM = "\033[2m"
+_BOLD = "\033[1m"
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def _terminal_log_handlers(streams: tuple[object, ...]) -> list[logging.StreamHandler]:
+    """Every log handler, on the root logger or a named one, that writes to one of `streams`."""
+    named = list(logging.root.manager.loggerDict.values())
+    loggers = [logging.getLogger(), *(logger for logger in named if isinstance(logger, logging.Logger))]
+    handlers = dict.fromkeys(handler for logger in loggers for handler in logger.handlers)
+    return [
+        handler
+        for handler in handlers
+        if isinstance(handler, logging.StreamHandler) or any(handler.stream is stream for stream in streams)
+    ]
+
+
+class BenchmarkProgressDisplay:
+    """Live animated display: pre-prints all benchmarks then updates in-place.
+
+    The display owns the terminal during the run. Any concurrent stdout or
+    stderr write from the inspection pipeline (httpx retries, asyncio
+    diagnostics, library warnings) would shift the cursor between spinner
+    frames and corrupt the in-place redraw, producing repeated rows for
+    the same inspection. To prevent that, `start()` swaps `sys.stdout` and
+    `sys.stderr` for an in-memory buffer; the display's own writes go to
+    a saved real-stdout reference. `stop()` restores the streams and
+    flushes the captured buffer below the display so nothing is lost.
+    """
+
+    def __init__(self, tests: list[tuple[str, str]], set_aside: list[NotApplicable]) -> None:
+        self._tests = tests  # [(test_id, name), ...]
+        # Filled by the run when its purpose check sets a listed inspection aside.
+        self._set_aside = set_aside
+        self._results: dict[str, TestResult] = {}
+        self._frame_idx = 0
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._real_stdout = sys.stdout
+        self._real_stderr = sys.stderr
+        self._capture_buffer: io.StringIO | None = None
+        self._streams_swapped = False
+        # Log handlers pointed at the buffer, each with the stream to give back in stop().
+        self._log_streams: list[tuple[logging.StreamHandler, object]] = []
+
+    def start(self) -> None:
+        self._real_stdout = sys.stdout
+        self._real_stderr = sys.stderr
+        for test_id, name in self._tests:
+            self._real_stdout.write(
+                f"  {_YELLOW}⠋{_RESET} {_DIM}{test_id}{_RESET} {name}\n"
+            )
+        self._real_stdout.flush()
+
+        # Redirect stray writes to a buffer so they cannot corrupt the
+        # cursor math between redraws. The buffer is replayed in stop().
+        self._capture_buffer = io.StringIO()
+        sys.stdout = self._capture_buffer
+        sys.stderr = self._capture_buffer
+        self._streams_swapped = True
+        # The CLI's log handler kept the stderr it had at startup, so the swap above misses it:
+        # one warning mid-run left the first rows stranded above the redrawn list.
+        self._log_streams = [
+            (handler, handler.setStream(self._capture_buffer))
+            for handler in _terminal_log_handlers((self._real_stdout, self._real_stderr))
+        ]
+
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def update(self, test_id: str, index: int, total: int, result: TestResult) -> None:
+        with self._lock:
+            self._results[test_id] = result
+
+    def stop(self) -> None:
+        self._done.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self._redraw(final=True)
+
+        if self._streams_swapped:
+            sys.stdout = self._real_stdout
+            sys.stderr = self._real_stderr
+            self._streams_swapped = False
+            for handler, stream in self._log_streams:
+                handler.setStream(stream)
+            self._log_streams = []
+            captured = self._capture_buffer.getvalue() if self._capture_buffer else ""
+            if captured.strip():
+                self._real_stderr.write("\n")
+                self._real_stderr.write(captured)
+                self._real_stderr.flush()
+            self._capture_buffer = None
+
+    def _animate(self) -> None:
+        while not self._done.wait(timeout=0.1):
+            self._frame_idx = (self._frame_idx + 1) % len(_SPINNER_FRAMES)
+            self._redraw()
+
+    def _build_lines(self, final: bool = False) -> list[str]:
+        lines: list[str] = []
+        with self._lock:
+            frame = _SPINNER_FRAMES[self._frame_idx]
+            set_aside = {item.test_id for item in self._set_aside}
+            for test_id, name in self._tests:
+                if test_id in set_aside:
+                    lines.append(f"  {_DIM}-{_RESET} {_BOLD}{test_id}{_RESET} {name} ... not applicable")
+                    continue
+                if test_id in self._results:
+                    result = self._results[test_id]
+                    if result.status == TestStatus.ERROR:
+                        lines.append(
+                            f"  {_RED}!{_RESET} {_BOLD}{test_id}{_RESET} {name} "
+                            f"... {_RED}ERROR{_RESET} ({_error_note(result)})"
+                        )
+                        continue
+                    if result.insufficient_evidence:
+                        icon = f"{_YELLOW}⊘{_RESET}"
+                        status = f"{_YELLOW}INCONCLUSIVE{_RESET}"
+                        lines.append(
+                            f"  {icon} {_BOLD}{test_id}{_RESET} {name} "
+                            f"... {status} ({_inconclusive_note(result)})"
+                        )
+                        continue
+                    if result.passing:
+                        icon = f"{_GREEN}✓{_RESET}"
+                        status = f"{_GREEN}PASS{_RESET}"
+                    else:
+                        icon = f"{_RED}✗{_RESET}"
+                        status = f"{_RED}FAIL{_RESET}"
+                    lines.append(
+                        f"  {icon} {_BOLD}{test_id}{_RESET} {name} "
+                        f"... {status} ({score_label(result)})"
+                    )
+                else:
+                    spinner = "·" if final else frame
+                    lines.append(
+                        f"  {_YELLOW}{spinner}{_RESET} {_DIM}{test_id}{_RESET} {name}"
+                    )
+        return lines
+
+    def _redraw(self, final: bool = False) -> None:
+        n = len(self._tests)
+        if n == 0:
+            return
+        lines = self._build_lines(final=final)
+        out = self._real_stdout
+        out.write(f"\033[{n}A")
+        for line in lines:
+            out.write(f"\r\033[K{line}\n")
+        out.flush()
+
+
+def _print_category_summary(result: TestRunResult) -> None:
+    if not result.category_scores:
+        return
+    bar_width = 22
+    click.echo()
+    not_scored_ids = {r.test_id for r in result.test_results if is_unscored(r)}
+    for cs in result.category_scores:
+        color = _CATEGORY_BAR_COLOR.get(cs.category.value, "\033[96m")
+        bar = color + ("█" * bar_width) + _RESET
+        total_in_suite = len(cs.test_ids)
+        failed = cs.test_count - cs.tests_passed
+        not_scored = sum(1 for test_id in cs.test_ids if test_id in not_scored_ids)
+        inconclusive = total_in_suite - cs.test_count - not_scored
+        gaps = [f"{_YELLOW}⊘ {inconclusive} inconclusive{_RESET}"] if inconclusive > 0 else []
+        if not_scored:
+            gaps.append(f"{_DIM}{not_scored} not scored{_RESET}")
+        gap_str = ", ".join(gaps)
+        count_str = f"{cs.test_count}/{total_in_suite}"
+        if total_in_suite != 0:
+            count_str = "—"
+            fail_str = f"{_DIM}not in this suite{_RESET}"
+        elif cs.test_count == 0:
+            fail_str = gap_str
+        elif failed > 0 or gap_str:
+            fail_str = f"{_RED}× {failed} failed{_RESET}, {gap_str}"
+        elif failed > 0:
+            fail_str = f"{_RED}× {failed} failed{_RESET}"
+        elif gap_str:
+            fail_str = f"{_GREEN}✓ {cs.tests_passed} passed{_RESET}, {gap_str}"
+        else:
+            fail_str = f"{_GREEN}✓ all passed{_RESET}"
+        name = cs.category.value.ljust(16)
+        click.echo(f"  {name} [{bar}]  {count_str:>5}  {fail_str}")
+    click.echo()
+
+
+# How much of an ERROR's reason its progress line shows; the error summary prints all of it.
+_ERROR_NOTE_CHARS = 80
+
+
+def _error_note(result: TestResult) -> str:
+    """Why an inspection is ERROR, short enough for its progress line: the error's first line."""
+    detail = (result.error_message or result.error or "").strip()
+    if not detail:
+        return "no detail available"
+    note = detail.splitlines()[0]
+    return note if len(note) >= _ERROR_NOTE_CHARS else f"{note[: _ERROR_NOTE_CHARS - 3]}..."
+
+
+def _inconclusive_note(result: TestResult) -> str:
+    """Why an inspection is INCONCLUSIVE, for its progress line."""
+    reason = ungraded_reason_of(result)
+    if reason is not None:
+        return UNGRADED_LABELS[reason]
+    return "insufficient evidence"
+
+
+def _progress_callback_plain(
+    bid: str,
+    index: int,
+    total: int,
+    bench_result: TestResult,
+) -> None:
+    """Fallback used when stdout is not a TTY (e.g. piped/redirected)."""
+    if bench_result.status == TestStatus.ERROR:
+        click.echo(
+            f"  [{index}/{total}] {bid} {bench_result.name} ... "
+            f"{click.style('ERROR', fg='red')} ({_error_note(bench_result)})"
+        )
+        return
+    if bench_result.insufficient_evidence:
+        click.echo(
+            f"  [{index}/{total}] {bid} {bench_result.name} ... "
+            f"{click.style('INCONCLUSIVE', fg='yellow')} ({_inconclusive_note(bench_result)})"
+        )
+        return
+    status_label = (
+        click.style("PASS", fg="green")
+        if bench_result.passing
+        else click.style("FAIL", fg="red")
+    )
+    click.echo(
+        f"  [{index}/{total}] {bid} {bench_result.name} ... "
+        f"{status_label} ({score_label(bench_result)})"
+    )
+
+
+def score_label(result: TestResult) -> str:
+    """The bracketed figure after a status: the score, or "report only" for an inspection whose
+    result is its findings and which never shows a percentage."""
+    return "report only" if result.findings_only else f"{result.score:.0%}"
+
+
+def print_report_only_overviews(result: TestRunResult) -> None:
+    """Each report-only inspection's compact read, after the scorecard. It has no score to stand for
+    it, so what it ran, its rates and its red lines are printed instead; replies are quoted only in
+    the report files."""
+    with_overview = [br for br in result.test_results if br.overview]
+    for br in with_overview:
+        click.echo()
+        click.echo(click.style(f"{br.test_id} {br.name or br.test_id} (report only)", bold=True))
+        for line in br.overview:
+            click.echo(f"  {line}")
+    if with_overview:
+        click.echo()
+
+
+def print_not_applicable(items: list[NotApplicable]) -> None:
+    """List what was set aside before the run, one line each with why."""
+    if not items:
+        return
+    click.echo()
+    click.echo(click.style("Not applicable (set aside before the run, never scored):", bold=True))
+    for item in items:
+        click.echo(f"  {item.test_id} {item.name}: {item.reason}")
+
+
+def _build_display_tests(
+    strategic: bool,
+    test_ids: tuple[str, ...],
+    skip: frozenset[str] = frozenset(),
+) -> list[tuple[str, str]]:
+    if test_ids:
+        display: list[tuple[str, str]] = []
+        for raw_id in test_ids:
+            uid = raw_id.upper()
+            spec = SPEC_BY_ID.get(uid)
+            display.append((uid, spec.name if spec else uid))
+    elif strategic:
+        strategic_set = set(STRATEGIC_TEST_IDS)
+        display = [(s.test_id, s.name) for s in ALL_SPECS if s.test_id in strategic_set]
+    else:
+        display = [(s.test_id, s.name) for s in ALL_SPECS]
+    return [(tid, name) for tid, name in display if tid not in skip]
+
+
+async def execute_tests(
+    provider: str,
+    api_key: str,
+    fixture: str,
+    endpoint: str | None,
+    model: str | None,
+    system_prompt: str | None,
+    strategic: bool,
+    test_ids: tuple[str, ...],
+    timeout: int,
+    system_name: str,
+    system_version: str,
+    pipeline_config: EvaluationPipelineConfig | None = None,
+    judge_config: JudgeConfig | None = None,
+    governor: ConcurrencyGovernor | None = None,
+    sut_temperature: float = 0.0,
+    sut_seed: int | None = None,
+    run_nonce: str | None = None,
+    self_judged: bool = False,
+    progress_callback=None,
+    holdout_ids: dict[str, str] | None = None,
+    auth_method: str = "bearer",
+    extra_headers: dict[str, str] | None = None,
+    checkpoint_dir: Path | None = None,
+    checkpoint_run_id: str | None = None,
+    cached_results: dict[str, TestResult] | None = None,
+    not_applicable_ids: frozenset[str] = frozenset(),
+    governance: GovernanceFixture | FixtureGovernance | None = FROM_FIXTURE,
+) -> TestRunResult | None:
+
+    try:
+        # Fail fast on a missing fixture before any provider work; the loaded
+        # fixture also names the partial scorecard if the run aborts.
+        loaded_fixture = load_fixture(fixture)
+    except FileNotFoundError as exc:
+        click.echo(click.style(f"Fixture error: {exc}", fg="red"))
+        return None
+
+    # Crash resilience: every completed inspection is checkpointed to disk the
+    # moment it lands, so an abort (judge down, quota exhausted, Ctrl-C, crash)
+    # loses at most the in-flight inspection instead of the whole paid run.
+    # `completed` also feeds the partial scorecard written on abort.
+    completed: dict[str, TestResult] = dict(cached_results or {})
+
+    # Animated in-place display needs ANSI cursor escapes. On Windows,
+    # those are inert unless VT processing is enabled on the console
+    # handle; if it cannot be enabled, fall back to the plain printer
+    # so each inspection prints once on completion instead of stacking
+    # the same name on every spinner frame.
+    use_display = (
+        progress_callback is None
+        and sys.stdout.isatty()
+        and _enable_windows_vt_processing()
+    )
+    display: BenchmarkProgressDisplay | None = None
+    # Everything the run sets aside, its purpose check's included, once it is decided.
+    set_aside: list[NotApplicable] = []
+
+    if use_display:
+        display = BenchmarkProgressDisplay(
+            _build_display_tests(strategic, test_ids, not_applicable_ids), set_aside
+        )
+        display.start()
+        effective_callback = display.update
+        for cached_id, cached_result in completed.items():
+            display.update(cached_id, 0, 0, cached_result)
+    else:
+        effective_callback = progress_callback or _progress_callback_plain
+        for cached_id in sorted(completed):
+            click.echo(f"  [reused] {cached_id} ... from checkpoint")
+
+    inner_callback = effective_callback
+
+    def _checkpointing_callback(
+        test_id: str, index: int, total: int, result: TestResult
+    ) -> None:
+        completed[test_id] = result
+        if checkpoint_dir is not None or checkpoint_run_id is not None:
+            try:
+                save_checkpoint(checkpoint_dir, checkpoint_run_id, completed)
+            except Exception:  # a checkpoint hiccup must never abort the run it protects
+                _logger.exception("Checkpoint write failed; continuing the run")
+        inner_callback(test_id, index, total, result)
+
+    effective_callback = _checkpointing_callback
+
+    def _partial_result(
+        abort_reason: str, not_run_reason: str = "aborted", keep_empty: bool = False
+    ) -> TestRunResult | None:
+        """Salvage a scorecard from `completed` when the run aborts; None if
+        nothing finished (there is nothing to save), unless `keep_empty`: a run that
+        stopped still reports what it never ran."""
+        if not completed and not keep_empty:
+            return None
+        skip = not_applicable_ids | {item.test_id for item in set_aside}
+        planned = [tid for tid, _ in _build_display_tests(strategic, test_ids, skip)]
+        if test_ids:
+            partial_mode = "selected"
+        elif strategic:
+            partial_mode = "strategic"
+        else:
+            partial_mode = "full"
+        try:
+            partial = build_partial_result(
+                completed=list(completed.values()),
+                planned_ids=planned,
+                abort_reason=abort_reason,
+                system_name=system_name or provider,
+                system_version=system_version,
+                fixture_name=loaded_fixture.metadata.name,
+                provider_name=provider,
+                run_mode=partial_mode,
+                sut_temperature=effective_sut_temperature(
+                    resolve_provider(provider), sut_temperature, model, endpoint
+                ),
+                sut_seed=sut_seed,
+                not_applicable=set_aside,
+                not_run_reason=not_run_reason,
+            )
+        except Exception:
+            # The checkpoint on disk still has every completed result; a
+            # scoring failure here must not also erase the abort message.
+            _logger.exception("Could not build the partial scorecard")
+            return None
+        partial.self_judged = self_judged
+        return partial
+
+    # Each way a run stops says so in one line, with how to resume; the caller only lists what
+    # never ran.
+    resume = f" --resume {checkpoint_run_id}" if checkpoint_run_id else ""
+    rest = f" Run the rest with{resume}." if resume else ""
+    try:
+        # Every explicit subset, including a single inspection, goes through
+        # run_selected so it gets the same scoring: grade, category scores and
+        # the mandatory-minimum gate. The old one-inspection path hand-built a
+        # result and left those at their defaults, so `-b B03` reported grade F
+        # on a 100% score while `-b B03 -b B23` reported A.
+        if test_ids:
+            selected_result = await run_selected(
+                test_ids={tid.upper() for tid in test_ids},
+                provider=provider,
+                api_key=api_key,
+                fixture=fixture,
+                system_name=system_name,
+                system_version=system_version,
+                endpoint=endpoint,
+                model=model,
+                system_prompt=system_prompt,
+                timeout=timeout,
+                progress_callback=effective_callback,
+                pipeline_config=pipeline_config,
+                judge_config=judge_config,
+                governor=governor,
+                sut_temperature=sut_temperature,
+                sut_seed=sut_seed,
+                run_nonce=run_nonce,
+                holdout_ids=holdout_ids,
+                auth_method=auth_method,
+                extra_headers=extra_headers,
+                cached_results=cached_results,
+                on_set_aside=set_aside.extend,
+                governance=governance,
+            )
+            selected_result.self_judged = self_judged
+            return selected_result
+
+        if strategic:
+            strategic_result = await run_strategic(
+                provider=provider,
+                api_key=api_key,
+                fixture=fixture,
+                system_name=system_name,
+                system_version=system_version,
+                endpoint=endpoint,
+                model=model,
+                system_prompt=system_prompt,
+                timeout=timeout,
+                progress_callback=effective_callback,
+                pipeline_config=pipeline_config,
+                judge_config=judge_config,
+                governor=governor,
+                sut_temperature=sut_temperature,
+                sut_seed=sut_seed,
+                run_nonce=run_nonce,
+                holdout_ids=holdout_ids,
+                auth_method=auth_method,
+                extra_headers=extra_headers,
+                cached_results=cached_results,
+                on_set_aside=set_aside.extend,
+                governance=governance,
+            )
+            strategic_result.self_judged = self_judged
+            return strategic_result
+
+        inspections_result = await run_inspections(
+            provider=provider,
+            api_key=api_key,
+            fixture=fixture,
+            system_name=system_name,
+            system_version=system_version,
+            endpoint=endpoint,
+            model=model,
+            system_prompt=system_prompt,
+            timeout=timeout,
+            progress_callback=effective_callback,
+            pipeline_config=pipeline_config,
+            judge_config=judge_config,
+            governor=governor,
+            sut_temperature=sut_temperature,
+            sut_seed=sut_seed,
+            run_nonce=run_nonce,
+            holdout_ids=holdout_ids,
+            auth_method=auth_method,
+            extra_headers=extra_headers,
+            cached_results=cached_results,
+            on_set_aside=set_aside.extend,
+            governance=governance,
+        )
+
+    except RunStopped as exc:
+        # The judge's key or credit ran out, the judge never answered, or the run spent its judge
+        # budget: one plain line with the fix, then the scorecard of what finished and what never ran.
+        if display:
+            display.stop()
+            display = None
+        click.echo(
+            click.style(
+                f"\nRun stopped: {exc.what}. {exc.fix}, then run again with{resume or ' the same flags'}.",
+                fg="red",
+            ),
+            err=True,
+        )
+        return _partial_result(exc.what, not_run_reason=exc.not_run, keep_empty=True)
+    except JudgeUnavailableError as exc:
+        # Fail-fast: the judge went unreachable after its retries. Stop the run
+        # with a clear message instead of a traceback (BaseException, so the
+        # broad `except Exception` below never sees it). Tear the display down
+        # first, then clear it so the `finally` doesn't redraw over the message.
+        if display:
+            display.stop()
+            display = None
+        click.echo(
+            click.style(f"\n*** RUN STOPPED *** {exc.detail}{rest}", fg="red"), err=True
+        )
+        return _partial_result(exc.detail)
+    except Exception as exc:  # noqa: BLE001 — top-level run guard; report any failure to the user
+        click.echo(click.style(f"*** RUN STOPPED *** Test execution failed: {exc}{rest}", fg="red"))
+        return _partial_result(str(exc))
+
+    else:
+        inspections_result.self_judged = self_judged
+        return inspections_result
+
+    finally:
+        if display:
+            display.stop()

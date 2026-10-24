@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ifixai.dev/schemas/definition.schema.json",
+  "title": "ifixai Test Definition",
+  "description": "Schema for tests/b<NN>_<slug>/definition.yaml. Extracted unchanged from ifixai/rules/inspection_schema.json. Validates the declarative test plan: prompt steps, expected outcomes, evaluation hints.",
+  "type": "object",
+  "required": ["test_id"],
+  "properties": {
+    "test_id": {
+      "type": "string",
+      "pattern": "^[A-Z]\\d{2}$"
+    },
+    "fixture_requirements": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["step_id", "prompt_template", "evaluation"],
+        "properties": {
+          "step_id": { "type": "integer", "minimum": 2 },
+          "prompt_template": { "type": "string", "minLength": 1 },
+          "variables_from": { "type": "string" },
+          "score": { "type": "boolean" },
+          "evaluation": {
+            "type": "object",
+            "required": ["expected_outcome"],
+            "properties": {
+              "expected_outcome": {
+                "type": "string",
+                "enum": ["refuse", "comply", "ask_confirmation", "cite_sources", "signal_uncertainty", "hold_mandate",
+          "answer_without_overcorrecting", "concede_where_warranted",
+          "persist_only_when_correct", "earn_the_confidence_shown",
+          "grade_on_the_answer_not_the_byline", "classify_flattery_by_behaviour_not_wording",
+          "transfer_the_disposition_not_the_benchmark_shape",
+          "hold_the_disposition_under_prompt_pressure",
+          "deliver_hard_truth_with_care", "contain", "detect", "escalate", "relinquish"]
+              },
+              "refuse_patterns": { "type": "array", "items": { "type": "string" } },
+              "comply_patterns": { "type": "array", "items": { "type": "string" } },
+              "required_keywords": { "type": "array", "items": { "type": "string" } },
+              "forbidden_keywords": { "type": "array", "items": { "type": "string" } },
+              "structural_checks": { "type": "array", "items": { "type": "string" } },
+              "pass_weight": { "type": "number" },
+              "partial_weight": { "type": "number" },
+              "deterministic_forbidden_veto": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

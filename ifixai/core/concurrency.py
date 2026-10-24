@@ -1,0 +1,106 @@
+import asyncio
+from contextlib import asynccontextmanager
+from typing import TypedDict
+
+RATE_LIMIT_RECOVERY_SECONDS = 30.0
+MIN_EFFECTIVE_LIMIT = 1
+MAX_CONCURRENCY_LIMIT = 20
+_RAMP_INTERVAL_SECONDS = 0.5
+
+
+class InspectionConcurrencyLimits(TypedDict):
+    b05: int
+    b07: int
+    b08: int
+    b09: int
+    b10: int
+    b12: int
+    b14: int
+    b17: int
+    b19: int
+    b20: int
+    b22: int
+    b28: int
+    b29: int
+    b30: int
+    b31: int
+    b32: int
+
+
+DEFAULT_INSPECTION_CONCURRENCY: InspectionConcurrencyLimits = {
+    "b05": 12,
+    "b07": 12,
+    "b08": 12,
+    "b09": 12,
+    "b10": 12,
+    "b12": 8,
+    "b14": 12,
+    "b17": 12,
+    "b19": 8,
+    "b20": 8,
+    "b22": 12,
+    "b28": 12,
+    "b29": 12,
+    "b30": 8,
+    "b31": 12,
+    "b32": 12,
+}
+
+
+async def _recover_effective_limit(governor: "ConcurrencyGovernor") -> None:
+    await asyncio.sleep(RATE_LIMIT_RECOVERY_SECONDS)
+    async with governor._rate_limit_lock:
+        governor.effective_limit = governor.configured_limit
+        governor._throttled = False
+        governor._recovery_task = None
+    # Wake waiters one at a time so they don't all burst at once and cause another 429.
+    for _ in range(governor.configured_limit):
+        async with governor._throttle_cond:
+            governor._throttle_cond.notify(1)
+        await asyncio.sleep(_RAMP_INTERVAL_SECONDS)
+    # Release any waiters that built up beyond configured_limit.
+    async with governor._throttle_cond:
+        governor._throttle_cond.notify_all()
+
+
+class ConcurrencyGovernor:
+
+    def __init__(self, configured_limit: int) -> None:
+        if not (1 <= configured_limit <= MAX_CONCURRENCY_LIMIT):
+            raise ValueError(
+                f"configured_limit must be between 1 and {MAX_CONCURRENCY_LIMIT} "
+                f"(got {configured_limit})"
+            )
+        self.configured_limit = configured_limit
+        self.effective_limit = configured_limit
+        self._semaphore = asyncio.Semaphore(configured_limit)
+        self._throttled: bool = False
+        self._throttle_cond = asyncio.Condition()
+        self._rate_limit_lock = asyncio.Lock()
+        self._recovery_task: asyncio.Task | None = None
+
+    @asynccontextmanager
+    async def acquire(self):
+        async with self._throttle_cond:
+            await self._throttle_cond.wait_for(lambda: not self._throttled)
+        async with self._semaphore:
+            # This call may have queued before a 429 started the cooldown.
+            # Recheck after admission so releasing an in-flight permit cannot
+            # silently bypass the shared throttle.
+            async with self._throttle_cond:
+                await self._throttle_cond.wait_for(lambda: not self._throttled)
+            yield
+
+    async def on_rate_limit(self) -> None:
+        async with self._rate_limit_lock:
+            new_limit = max(MIN_EFFECTIVE_LIMIT, self.effective_limit // 2)
+            if new_limit != self.effective_limit:
+                self.effective_limit = new_limit
+            self._throttled = True
+            if self._recovery_task is not None and not self._recovery_task.done():
+                self._recovery_task.cancel()
+            self._recovery_task = asyncio.create_task(_recover_effective_limit(self))
+
+    @property
+    def is_sequential(self) -> bool:
+        return self.configured_limit == 1

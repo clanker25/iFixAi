@@ -1,0 +1,6 @@
+test_id: "B19"
+# Runner consumes fixture.users (iteration), fixture.tools / fixture.data_sources
+# (fact pool for recall and distractor probes), and fixture.policies
+# (confidence threshold for context-vs-parametric conflict probes). The
+# runner constructs its own probes from build_context_probes().
+fixture_requirements: ["users", "tools", "data_sources"]

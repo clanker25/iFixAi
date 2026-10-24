@@ -1,0 +1,255 @@
+import asyncio
+import os
+import re
+from urllib.parse import urlsplit
+
+import google.generativeai as genai
+from google.ai.generativelanguage import GenerativeServiceAsyncClient
+from google.api_core import exceptions as google_exceptions
+
+from ifixai.core.types import ChatMessage, ProviderConfig
+from ifixai.evaluation.run_stop import count_request
+from ifixai.providers.base import (
+    RETRYABLE_HTTP_STATUS_CODES,
+    ChatProvider,
+    ProviderAuthError,
+    ProviderConnectionError,
+    ProviderEmptyContentError,
+    ProviderOverloadedError,
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderTimeoutError,
+    raise_if_truncated,
+)
+from ifixai.providers.schemas import GeminiMessages
+
+DEFAULT_MODEL = "gemini-2.0-flash"
+
+INITIAL_BACKOFF_SECONDS = 1.0
+BACKOFF_MULTIPLIER = 2.0
+
+
+class GeminiProvider(ChatProvider):
+
+    def __init__(self) -> None:
+        pass
+
+    async def send_message(
+        self,
+        messages: list[ChatMessage],
+        config: ProviderConfig,
+    ) -> str:
+        model_name = config.model or DEFAULT_MODEL
+        endpoint = config.endpoint or "https://generativelanguage.googleapis.com"
+
+        formatted = _format_messages(messages)
+        system_instruction = formatted["system_instruction"]
+        contents = formatted["contents"]
+
+        gen_config_kwargs: dict = {
+            "candidate_count": 1,
+            "temperature": config.temperature,
+        }
+        if config.max_tokens is not None:
+            gen_config_kwargs["max_output_tokens"] = config.max_tokens
+        if config.json_output:
+            # Judge calls only: ask for valid JSON so cheap models emit a parseable
+            # verdict. Unsupported models fall back without this optional field.
+            gen_config_kwargs["response_mime_type"] = "application/json"
+        # Gemini SDK does not expose a `seed` parameter at the time of
+        # writing. Seed remains tracked on ProviderConfig for manifest
+        # reproducibility; the API call cannot pin it.
+        generation_config = genai.types.GenerationConfig(**gen_config_kwargs)
+
+        model_kwargs: dict = {"model_name": model_name}
+        if system_instruction:
+            model_kwargs["system_instruction"] = system_instruction
+
+        model = genai.GenerativeModel(
+            generation_config=generation_config,
+            **model_kwargs,
+        )
+
+        attempts = config.max_retries + 1
+        backoff = INITIAL_BACKOFF_SECONDS
+
+        # GenerativeModel lazily resolves a process-global client. Bind a
+        # request-owned client before scheduling the generation so another SUT
+        # or judge call cannot replace this request's API key.
+        async with GenerativeServiceAsyncClient(
+            client_options={
+                "api_endpoint": (
+                    urlsplit(config.endpoint).netloc
+                    if config.endpoint and "://" in config.endpoint
+                    else config.endpoint or "generativelanguage.googleapis.com"
+                ),
+                "api_key": (
+                    config.api_key or os.environ.get("GEMINI_API_KEY")
+                    or os.environ.get("GOOGLE_API_KEY")
+                ),
+            },
+        ) as native_client:
+            model._async_client = native_client
+            for attempt in range(attempts):
+                try:
+                    for format_attempt in range(2):
+                        count_request()
+                        try:
+                            response = await asyncio.wait_for(
+                                model.generate_content_async(
+                                    contents,
+                                    request_options=genai.types.RequestOptions(
+                                        retry=None, timeout=float(config.timeout)
+                                    ),
+                                ),
+                                timeout=float(config.timeout),
+                            )
+                            break
+                        except google_exceptions.InvalidArgument as exc:
+                            if format_attempt or "response_mime_type" not in gen_config_kwargs or not _json_mode_unsupported(exc):
+                                raise
+                            # Capability fallback is separate from transient retries:
+                            # preserve the current attempt and remove only JSON mode.
+                            gen_config_kwargs.pop("response_mime_type")
+                            model = genai.GenerativeModel(
+                                generation_config=genai.types.GenerationConfig(**gen_config_kwargs),
+                                **model_kwargs,
+                            )
+                            setattr(model, "_async_client", native_client)
+
+
+                    if not response.candidates:
+                        raise ProviderResponseError(
+                            provider="gemini",
+                            endpoint=endpoint,
+                            details="No candidates in response",
+                        )
+
+                    candidate = response.candidates[0]
+                    text_parts = [
+                        part.text
+                        for part in candidate.content.parts
+                        if hasattr(part, "text") and part.text
+                    ]
+                    if config.reject_truncated:
+                        raise_if_truncated(
+                            "gemini", endpoint,
+                            getattr(candidate.finish_reason, "name", ""),
+                            "\n".join(text_parts),
+                        )
+                    if not text_parts:
+                        raise ProviderEmptyContentError(
+                            provider="gemini",
+                            endpoint=endpoint,
+                            details="No text parts in response candidate",
+                        )
+                    return "\n".join(text_parts)
+
+                except (asyncio.TimeoutError, google_exceptions.DeadlineExceeded) as exc:
+                    raise ProviderTimeoutError(
+                        provider="gemini",
+                        endpoint=endpoint,
+                        details=(
+                            f"Request timed out after {config.timeout}s"
+                            if isinstance(exc, asyncio.TimeoutError) else str(exc)
+                        ),
+                    ) from exc
+                except google_exceptions.Unauthenticated as exc:
+                    raise ProviderAuthError(
+                        provider="gemini",
+                        endpoint=endpoint,
+                        details=str(exc),
+                    ) from exc
+                except google_exceptions.PermissionDenied as exc:
+                    raise ProviderAuthError(
+                        provider="gemini",
+                        endpoint=endpoint,
+                        details=str(exc),
+                    ) from exc
+                except google_exceptions.ResourceExhausted as exc:
+                    if attempt < attempts - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= BACKOFF_MULTIPLIER
+                        continue
+                    raise ProviderRateLimitError(
+                        provider="gemini",
+                        endpoint=endpoint,
+                        details=str(exc),
+                    ) from exc
+                except google_exceptions.ServiceUnavailable as exc:
+                    if attempt > attempts - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= BACKOFF_MULTIPLIER
+                        continue
+                    raise ProviderConnectionError(
+                        provider="gemini",
+                        endpoint=endpoint,
+                        details=str(exc),
+                    ) from exc
+                except google_exceptions.GoogleAPIError as exc:
+                    if _invalid_api_key(exc):
+                        raise ProviderAuthError(
+                            provider="gemini",
+                            endpoint=endpoint,
+                            details=str(exc),
+                        ) from exc
+                    if getattr(exc, "code", None) in RETRYABLE_HTTP_STATUS_CODES:
+                        if attempt < attempts - 1:
+                            await asyncio.sleep(backoff)
+                            backoff *= BACKOFF_MULTIPLIER
+                            continue
+                        raise ProviderOverloadedError(
+                            provider="gemini", endpoint=endpoint, details=str(exc),
+                        ) from exc
+                    raise ProviderResponseError(
+                        provider="gemini",
+                        endpoint=endpoint,
+                        details=str(exc),
+                    ) from exc
+
+            raise ProviderRateLimitError(
+                provider="gemini",
+                endpoint=endpoint,
+                details="Exhausted all retry attempts",
+            )
+
+
+def _format_messages(
+    messages: list[ChatMessage],
+) -> GeminiMessages:
+    system_instructions: list[str] = []
+    contents: list[dict] = []
+
+    for msg in messages:
+        if msg.role == "system":
+            system_instructions.append(msg.content)
+        else:
+            gemini_role = "model" if msg.role == "assistant" else "user"
+            contents.append(
+                {
+                    "role": gemini_role,
+                    "parts": [{"text": msg.content}],
+                }
+            )
+
+    return GeminiMessages(system_instruction="\n".join(system_instructions), contents=contents)
+
+
+def _invalid_api_key(exc: google_exceptions.GoogleAPIError) -> bool:
+    # Google rejects a bad key as 400 INVALID_ARGUMENT, not UNAUTHENTICATED.
+    return (
+        getattr(exc, "reason", None) == "API_KEY_INVALID"
+        or "api key not valid" in str(exc).lower()
+    )
+
+
+def _json_mode_unsupported(exc: google_exceptions.InvalidArgument) -> bool:
+    message = " ".join(str(exc).lower().split())
+    return bool(
+        re.search(r"\bjson mode (?:is )?(?:not enabled|not supported|unsupported)\b", message)
+        or re.search(
+            r"(?:response_mime_type|response mime type)\s*[:=]?\s*['\"]?"
+            r"application/json['\"]?\s+(?:is\s+)?(?:not supported|unsupported)\b",
+            message,
+        )
+    )

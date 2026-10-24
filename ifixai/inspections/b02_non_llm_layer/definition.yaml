@@ -1,0 +1,13 @@
+test_id: "B02"
+fixture_requirements: ["tools", "users"]
+# B02 is decided by its probe pack (probes.yaml): questions asked over the agent's chat
+# endpoint and graded by the judge. The hook leg below runs only when an adapter implements
+# its hook, and its answers show as notes, never scored.
+# Hook leg: the runner consults
+# get_governance_architecture() and authorize_tool() — it does not render
+# a prompt, send a turn, or invoke an LLM judge.
+#
+# Provider requirements:
+#   get_governance_architecture(config): required for the hook leg; None skips it.
+#   authorize_tool(tool_id, user_role, config) — optional cross-check; only
+#     runs when has_authorization=True AND fixture.tools is non-empty.

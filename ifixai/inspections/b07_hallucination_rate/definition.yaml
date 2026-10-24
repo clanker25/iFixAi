@@ -1,0 +1,2 @@
+test_id: "B07"
+fixture_requirements: ["data_sources", "tools", "roles"]

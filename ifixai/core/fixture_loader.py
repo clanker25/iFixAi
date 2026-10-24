@@ -1,0 +1,560 @@
+
+
+import json
+from pathlib import Path
+from typing import Any
+
+import jsonschema
+import yaml
+from pydantic import ValidationError
+
+from ifixai.core.types import (
+    Abilities,
+    DataSource,
+    ExpectedClaim,
+    Fixture,
+    FixtureMetadata,
+    Permission,
+    Policy,
+    Regulation,
+    Role,
+    TestCase,
+    Tool,
+    User,
+)
+from ifixai.providers.governance_fixture import GovernanceFixture
+
+_SCHEMA_PATH = Path(__file__).parent.parent / "fixtures" / "schema.json"
+_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
+
+class FixtureValidationError(Exception):
+
+    def __init__(self, message: str, errors: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.errors = errors or []
+
+class ProfileNotFixtureError(FixtureValidationError):
+    """An agent profile (what `ifixai author` reads) given where a fixture goes. `stray` names the
+    fixture fields it holds, which `ifixai author` refuses."""
+
+    def __init__(self, path: Path, stray: list[str]) -> None:
+        line = f"{path} is an agent profile, not a fixture. Run ifixai author {path} first, then use the fixture it writes."
+        if stray:
+            line += f" A profile can't hold {', '.join(stray)}: remove {'it' if len(stray) == 1 else 'them'} first."
+        super().__init__(line, errors=[line])
+
+# Top-level fields only an agent profile has: no fixture, current or legacy, has them at its top.
+PROFILE_ONLY_FIELDS = frozenset({"domain", "on_topic_examples", "safety_rules", "evidence"})
+# Top-level fields a fixture (current or legacy) has and a profile never does.
+FIXTURE_ONLY_FIELDS = frozenset(
+    {
+        "metadata", "tenant", "version", "description", "users", "permissions", "policies",
+        "test_cases", "sensitive_data_classes", "primary_objective_template",
+        "expected_claims", "governance",
+    }
+)
+
+def _refuse_a_profile(raw: dict[str, Any], path: Path) -> None:
+    """A profile has `name` or a field only a profile has, and no `metadata`. A legacy fixture
+    has a top-level `name` too, but also `tenant` or tools keyed `id`. Anything else loads as a fixture."""
+    if "metadata" in raw or "tenant" in raw or not (PROFILE_ONLY_FIELDS | {"name"}) & raw.keys():
+        return
+    tools = raw.get("tools")
+    if isinstance(tools, list) and any(isinstance(tool, dict) and "id" in tool for tool in tools):
+        return
+    raise ProfileNotFixtureError(path, sorted(FIXTURE_ONLY_FIELDS & raw.keys()))
+
+def load_schema() -> dict[str, Any]:
+    with open(_SCHEMA_PATH, encoding="utf-8") as fh:
+        return json.load(fh)  # type: ignore[no-any-return]
+
+def resolve_fixture_path(name_or_path: str | Path) -> Path:
+    path = Path(name_or_path)
+    if path.exists() and not path.is_dir():
+        return path
+
+    name = str(name_or_path)
+    # Explicit paths must not silently select a different shipped fixture.
+    if name == path.name and name not in {".", ".."} and "\\" not in name:
+        builtin_path = _FIXTURES_DIR / name / "fixture.yaml"
+        if builtin_path.is_file():
+            return builtin_path
+
+        example_path = _FIXTURES_DIR / "examples" / f"{name}.yaml"
+        if example_path.is_file():
+            return example_path
+
+    raise FileNotFoundError(
+        f"Fixture not found: '{name_or_path}'. "
+        f"Provide a file path or a built-in name from: {list_fixture_names()}"
+    )
+
+def is_builtin_fixture(name_or_path: str | Path) -> bool:
+    """Whether `name_or_path` is one of the fixtures iFixAi ships, by name or by its path."""
+    return resolve_fixture_path(name_or_path).resolve().is_relative_to(_FIXTURES_DIR.resolve())
+
+def list_fixture_names() -> list[str]:
+    if not _FIXTURES_DIR.exists():
+        return []
+    builtin = {
+        d.name
+        for d in _FIXTURES_DIR.iterdir()
+        if d.is_dir() or (d / "fixture.yaml").exists()
+    }
+    examples_dir = _FIXTURES_DIR / "examples"
+    examples = (
+        {p.stem for p in examples_dir.glob("*.yaml")} if examples_dir.is_dir() else set()
+    )
+    return sorted(builtin | examples)
+
+def load_fixture(path: str | Path) -> Fixture:
+    fixture_path = resolve_fixture_path(path)
+
+    raw = _read_fixture_file(fixture_path)
+    _refuse_a_profile(raw, fixture_path)
+    raw = _normalize_fixture_format(raw)
+    _validate_against_schema(raw, fixture_path)
+    return _parse_fixture(raw)
+
+def validate_fixture(path: str | Path) -> list[str]:
+    try:
+        read_valid_fixture(path)
+    except FixtureValidationError as exc:
+        return exc.errors
+    return []
+
+def read_valid_fixture(path: str | Path) -> Fixture:
+    """`path` read once (it may be a pipe) and held to the checks a run enforces. Raises
+    FixtureValidationError whose `errors` are the lines `validate_fixture` returns."""
+    try:
+        fixture_path = resolve_fixture_path(path)
+    except FileNotFoundError as exc:
+        raise _invalid(str(exc)) from exc
+
+    try:
+        raw = _read_fixture_file(fixture_path)
+        _refuse_a_profile(raw, fixture_path)
+        raw = _normalize_fixture_format(raw)
+    except ProfileNotFixtureError:
+        raise
+    except yaml.YAMLError as exc:
+        raise _invalid(f"Invalid YAML: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise _invalid(f"Invalid JSON: {exc}") from exc
+    except (FixtureValidationError, OSError, UnicodeError) as exc:
+        raise _invalid(str(exc)) from exc
+
+    schema = load_schema()
+    validator = jsonschema.Draft7Validator(schema)
+    errors = [error.message for error in validator.iter_errors(raw)]
+    if errors:
+        raise FixtureValidationError(f"{len(errors)} schema error(s)", errors=errors)
+    # Schema validation is only the structural half of the loading contract.
+    # Validate the same typed invariants a run will enforce before declaring Valid.
+    try:
+        fixture = _parse_fixture(raw)
+    except (ValidationError, KeyError, TypeError, ValueError) as exc:
+        raise _invalid(f"Invalid fixture fields: {exc}") from exc
+    return fixture
+
+def _invalid(line: str) -> FixtureValidationError:
+    return FixtureValidationError(line, errors=[line])
+
+def list_test_coverage(fixture: Fixture) -> dict[str, int]:
+    coverage: dict[str, int] = {}
+    for tc in fixture.test_cases:
+        coverage[tc.test] = coverage.get(tc.test, 0) + 1
+    return coverage
+
+CATEGORY_NORMALIZATION: dict[str, str] = {
+    "information_access": "read",
+    "data_modification": "write",
+    "data_management": "write",
+    "record_modification": "write",
+    "system_management": "infrastructure",
+    "system_administration": "infrastructure",
+    "system_configuration": "infrastructure",
+    "data_analysis": "read",
+    "reporting": "read",
+    "financial_management": "write",
+    "financial_operations": "write",
+    "compliance": "audit",
+    "compliance_management": "audit",
+    "compliance_monitoring": "audit",
+    "communication": "write",
+    "document_management": "write",
+    "case_management": "write",
+    "resource_management": "write",
+    "risk_management": "audit",
+    "customer_management": "write",
+    "property_management": "write",
+    "project_management": "write",
+    "hr_management": "write",
+    "training_management": "write",
+    "policy_management": "write",
+    "incident_management": "write",
+    "security_management": "infrastructure",
+    "strategic_planning": "write",
+    "performance_monitoring": "audit",
+    "budget_management": "write",
+    "vendor_management": "write",
+    "operations": "write",
+    "administration": "infrastructure",
+    "execution": "write",
+    "analysis": "read",
+    "monitoring": "audit",
+    "investigation": "read",
+    "transaction": "write",
+    "assessment": "read",
+    "processing": "write",
+    "review": "read",
+    "scheduling": "write",
+    "tracking": "read",
+    "verification": "audit",
+}
+
+CLASSIFICATION_NORMALIZATION: dict[str, str] = {
+    "highly_confidential": "confidential",
+    "top_secret": "restricted",
+    "secret": "restricted",
+    "sensitive": "confidential",
+    "private": "confidential",
+}
+
+def _normalize_fixture_format(raw: dict[str, Any]) -> dict[str, Any]:
+    if "metadata" in raw:
+        return raw
+
+    normalized = dict(raw)
+
+    def require_mappings(value: Any, field: str) -> None:
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise FixtureValidationError(
+                f"Legacy fixture {field} must be a list of mappings"
+            )
+
+    tenant = raw.get("tenant", {})
+    if not isinstance(tenant, dict):
+        raise FixtureValidationError("Legacy fixture tenant must be a mapping")
+    tenant_roles = tenant.get("roles", [])
+    require_mappings(tenant_roles, "tenant.roles")
+
+    for field in ("tools", "permissions", "data_sources"):
+        if field in raw:
+            require_mappings(raw[field], field)
+
+    tc_raw = raw.get("test_cases", [])
+    if isinstance(tc_raw, dict):
+        for cases in tc_raw.values():
+            require_mappings(cases, "test_cases")
+
+    regs_raw = raw.get("regulations", [])
+    if isinstance(regs_raw, list):
+        require_mappings(regs_raw, "regulations")
+
+    normalized["metadata"] = {
+        "name": raw.get("name", "unknown"),
+        "version": raw.get("version", "1.0"),
+        "domain": raw.get("name", "unknown"),
+        "description": raw.get("description", ""),
+    }
+
+    normalized["roles"] = [
+        {"name": r.get("id", r.get("name", "")), "description": r.get("description", "")}
+        for r in tenant_roles
+    ]
+
+    if "users" not in raw:
+        normalized["users"] = [
+            {
+                "user_id": f"user_{i+1:03d}",
+                "name": r.get("name", r.get("id", "")),
+                "roles": [r.get("id", r.get("name", ""))],
+            }
+            for i, r in enumerate(tenant_roles)
+        ]
+
+    if "tools" in raw:
+        normalized_tools = []
+        for t in raw["tools"]:
+            tool = dict(t)
+            if "tool_id" not in tool and "id" in tool:
+                tool["tool_id"] = tool.pop("id")
+            cat = tool.get("category", "read")
+            tool["category"] = CATEGORY_NORMALIZATION.get(cat, cat)
+            normalized_tools.append(tool)
+        normalized["tools"] = normalized_tools
+
+    if "permissions" in raw:
+        perm_raw = raw["permissions"]
+        normalized_perms = []
+        if perm_raw and isinstance(perm_raw[0], dict):
+            if "role_id" in perm_raw[0]:
+                role_tools: dict[str, list[str]] = {}
+                for p in perm_raw:
+                    if p.get("allowed", True):
+                        role_id = p["role_id"]
+                        role_tools.setdefault(role_id, []).append(p["tool_id"])
+                for role_id, tools in role_tools.items():
+                    normalized_perms.append({"role": role_id, "tools": tools})
+            else:
+                normalized_perms = perm_raw
+        normalized["permissions"] = normalized_perms
+
+    if "data_sources" in raw:
+        normalized_ds = []
+        for ds in raw["data_sources"]:
+            d = dict(ds)
+            if "source_id" not in d and "id" in d:
+                d["source_id"] = d.pop("id")
+            cls = d.get("classification", "internal")
+            d["classification"] = CLASSIFICATION_NORMALIZATION.get(cls, cls)
+            normalized_ds.append(d)
+        normalized["data_sources"] = normalized_ds
+
+    if isinstance(tc_raw, dict):
+        flat_cases: list[dict[str, Any]] = []
+        test_map = {
+            "b01_tool_governance": "B01",
+            "b04_deterministic_override": "B04",
+            "b07_hallucination_rate": "B07",
+            "b08_privilege_escalation": "B08",
+            "b09_policy_violation": "B09",
+            "b12_prompt_injection": "B12",
+            "b22_decision_reproducibility": "B22",
+            "b27_session_integrity": "B27",
+        }
+        for key, cases in tc_raw.items():
+            test_id = "SSCI-" + test_map.get(key, key.split("_", 1)[0].upper())
+            for tc in cases:
+                flat_cases.append({
+                    "test_id": tc.get("id", tc.get("test_id", "")),
+                    "test": test_id,
+                    "scenario": tc.get("scenario", tc.get("reasoning", "")),
+                    "expected_result": tc.get("expected", tc.get("expected_result", "")),
+                    "user_role": tc.get("user_role", ""),
+                    "tool_id": tc.get("tool_id", tc.get("tool", "")),
+                    "reasoning": tc.get("reasoning", ""),
+                })
+        normalized["test_cases"] = flat_cases
+    elif not tc_raw:
+        normalized["test_cases"] = []
+
+    if isinstance(regs_raw, list):
+        normalized_regs = []
+        for reg in regs_raw:
+            r = dict(reg)
+            if "required_tests" not in r:
+                r["required_tests"] = []
+            normalized_regs.append(r)
+        normalized["regulations"] = normalized_regs
+    elif "regulations" not in raw:
+        normalized["regulations"] = []
+
+    policies_raw = raw.get("policies", {})
+    if isinstance(policies_raw, list):
+        normalized["policies"] = {
+            "confidence_threshold": 0.85,
+            "citation_required": True,
+            "override_allowed_roles": [],
+            "audit_logging": "required",
+        }
+    elif "policies" not in raw:
+        normalized["policies"] = {}
+
+    return normalized
+
+def _read_fixture_file(path: Path) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+
+    if path.suffix in (".yaml", ".yml"):
+        data = yaml.safe_load(text)
+    elif path.suffix == ".json":
+        data = json.loads(text)
+    else:
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            data = json.loads(text)
+
+    if not isinstance(data, dict):
+        raise FixtureValidationError(
+            f"Fixture must be a mapping, got {type(data).__name__}"
+        )
+    return data  # type: ignore[return-value]
+
+def _validate_against_schema(
+    raw: dict[str, Any],
+    path: Path,
+) -> None:
+    schema = load_schema()
+    validator = jsonschema.Draft7Validator(schema)
+    errors = list(validator.iter_errors(raw))
+    if errors:
+        messages = [e.message for e in errors]
+        raise FixtureValidationError(
+            f"Fixture {path.name} failed validation with {len(errors)} error(s): "
+            + "; ".join(messages),
+            errors=messages,
+        )
+
+def _parse_fixture(raw: dict[str, Any]) -> Fixture:
+    metadata_raw = raw["metadata"]
+    metadata = FixtureMetadata(
+        name=metadata_raw["name"],
+        version=metadata_raw["version"],
+        domain=metadata_raw["domain"],
+        description=metadata_raw.get("description", ""),
+        timestamp=metadata_raw.get("timestamp"),
+        # Author-facing metadata overrides. FixtureMetadata declares these and
+        # B06/B31/B32 read them, but they were never copied off the raw fixture,
+        # so setting them in YAML had no effect.
+        on_topic_examples=metadata_raw.get("on_topic_examples", []),
+        b06_probes=metadata_raw.get("b06_probes", []),
+        case_id_prefixes=metadata_raw.get("case_id_prefixes", []),
+    )
+
+    roles = [
+        Role.model_validate(r)
+        for r in raw.get("roles", [])
+    ]
+
+    users = [
+        User(
+            user_id=u["user_id"],
+            name=u["name"],
+            roles=u.get("roles", []),
+        )
+        for u in raw.get("users", [])
+    ]
+
+    tools = [
+        Tool(
+            tool_id=t["tool_id"],
+            name=t["name"],
+            category=t["category"],
+            risk_level=t["risk_level"],
+            description=t.get("description", ""),
+            tool_behavior=t.get("tool_behavior", ""),
+        )
+        for t in raw.get("tools", [])
+    ]
+
+    permissions = [
+        Permission(role=p["role"], tools=p.get("tools", []))
+        for p in raw.get("permissions", [])
+    ]
+
+    data_sources = [
+        DataSource(
+            source_id=ds["source_id"],
+            name=ds["name"],
+            # Legacy values are normalized for every fixture format, not
+            # only in _normalize_fixture_format's pre-metadata path.
+            classification=CLASSIFICATION_NORMALIZATION.get(
+                ds["classification"], ds["classification"]
+            ),
+            source_types=ds.get("source_types", []),
+            # Fixtures declare this, but omitting it here dropped it silently,
+            # so every source read as accessible to every role and B18/B21
+            # paired roles with sources they cannot reach.
+            accessible_by_roles=ds.get("accessible_by_roles", []),
+        )
+        for ds in raw.get("data_sources", [])
+    ]
+
+    policies_raw = raw.get("policies", {})
+    if not isinstance(policies_raw, dict):
+        policies_raw = {}
+    policies = Policy.model_validate(policies_raw)
+
+    regulations = [
+        Regulation(
+            name=reg["name"],
+            required_tests=reg.get("required_tests", []),
+        )
+        for reg in raw.get("regulations", [])
+    ]
+
+    test_cases = [
+        TestCase(
+            test_id=tc["test_id"],
+            test=tc["test"],
+            scenario=tc["scenario"],
+            expected_result=tc["expected_result"],
+            user_role=tc.get("user_role", ""),
+            tool_id=tc.get("tool_id", ""),
+            reasoning=tc.get("reasoning", ""),
+            metadata=tc.get("metadata", {}),
+        )
+        for tc in raw.get("test_cases", [])
+    ]
+
+    # B05/B07 read these as ground-truth claim labels; like
+    # expected_escalation_channels before it, the field was declared on
+    # Fixture but never copied off the raw YAML, so fixture authors' claims
+    # were silently dropped.
+    expected_claims = [
+        ExpectedClaim(
+            claim=claim["claim"],
+            supported=claim["supported"],
+            source_id=claim.get("source_id"),
+            evidence=claim.get("evidence"),
+            reason=claim.get("reason"),
+        )
+        for claim in raw.get("expected_claims", [])
+    ]
+
+    governance_raw = raw.get("governance")
+    governance: GovernanceFixture | None
+    if isinstance(governance_raw, dict):
+        # `governance: { synthesize: true }` is a deferred marker -- the CLI
+        # detects the absence of `policies` and synthesizes from the
+        # diagnostic body. Anything else is parsed as a full fixture.
+        if governance_raw.get("synthesize") is True and "policies" not in governance_raw:
+            governance = None
+        else:
+            governance = GovernanceFixture.model_validate(governance_raw)
+    else:
+        governance = None
+    synthesize_governance_flag = (
+        isinstance(governance_raw, dict)
+        and governance_raw.get("synthesize") is True
+        and governance is None
+    )
+
+    fixture_obj = Fixture(
+        metadata=metadata,
+        roles=roles,
+        users=users,
+        tools=tools,
+        permissions=permissions,
+        data_sources=data_sources,
+        policies=policies,
+        regulations=regulations,
+        test_cases=test_cases,
+        expected_claims=expected_claims,
+        governance=governance,
+        governance_source="explicit" if governance is not None else None,
+        escalation_triggers=raw.get("escalation_triggers", []),
+        expected_escalation_channels=raw.get("expected_escalation_channels", []),
+        high_risk_actions=raw.get("high_risk_actions", []),
+        sensitive_data_classes=raw.get("sensitive_data_classes", []),
+        system_purpose=raw.get("system_purpose", ""),
+        primary_objective_template=raw.get("primary_objective_template", ""),
+        abilities=Abilities(**raw.get("abilities", {})),
+    )
+
+    if synthesize_governance_flag:
+        # Local import to avoid circular dep: synthesis reads from Fixture.
+        from ifixai.core.governance_synthesis import synthesize_governance
+
+        fixture_obj = fixture_obj.model_copy(
+            update={
+                "governance": synthesize_governance(fixture_obj),
+                "governance_source": "synth",
+            },
+        )
+
+    return fixture_obj

@@ -1,0 +1,197 @@
+"""Named test suites for the ``--suite`` selector (tiers and themes)."""
+
+from __future__ import annotations
+
+from typing import TypedDict
+
+from ifixai.core.types import InspectionCategory
+
+_CORE_PILLARS: frozenset[InspectionCategory] = frozenset(
+    {
+        InspectionCategory.FABRICATION,
+        InspectionCategory.MANIPULATION,
+        InspectionCategory.DECEPTION,
+        InspectionCategory.UNPREDICTABILITY,
+        InspectionCategory.OPACITY,
+    }
+)
+
+ESSENTIAL_HIGH_IMPACT_IDS: list[str] = ["B01", "B08", "P01", "B12", "B09", "B27"]
+ESSENTIAL_MEDIUM_IMPACT_IDS: list[str] = ["B06", "B16", "B18", "B20"]
+ESSENTIAL_TEST_IDS: list[str] = [
+    *ESSENTIAL_HIGH_IMPACT_IDS,
+    *ESSENTIAL_MEDIUM_IMPACT_IDS,
+]
+
+DEFAULT_SUITE = "essential"
+
+
+class SuiteResolution(TypedDict):
+    test_ids: list[str]
+    unknown: list[str]
+
+
+def _core_ids() -> list[str]:
+    from ifixai.harness.registry import ALL_SPECS
+
+    return [s.test_id for s in ALL_SPECS if s.category in _CORE_PILLARS]
+
+
+def _extended_ids() -> list[str]:
+    from ifixai.harness.registry import ALL_SPECS
+
+    return [s.test_id for s in ALL_SPECS if s.category not in _CORE_PILLARS]
+
+
+def _all_ids() -> list[str]:
+    from ifixai.harness.registry import ALL_SPECS
+
+    return [s.test_id for s in ALL_SPECS]
+
+
+def _strategic_ids() -> list[str]:
+    from ifixai.harness.registry import STRATEGIC_TESTS
+
+    return list(STRATEGIC_TESTS)
+
+
+def _smoke_ids() -> list[str]:
+    return _strategic_ids()[:3]
+
+
+def essential_ids() -> list[str]:
+    return list(ESSENTIAL_TEST_IDS)
+
+
+_TIER_RESOLVERS: dict[str, callable[[], list[str]]] = {
+    "smoke": _smoke_ids,
+    "strategic": _strategic_ids,
+    "essential": essential_ids,
+    "core": _core_ids,
+    "extended": _extended_ids,
+    "all": _all_ids,
+}
+
+# A description that quotes its own size takes `{count}` and is filled from the
+# resolved suite, so the two cannot disagree. `extended` previously read "The 28
+# frontier inspections" while resolving to 29, and `ifixai list suites` printed
+# both numbers in the same row.
+_TIER_DESCRIPTIONS: dict[str, str] = {
+    "smoke": "Fastest sanity check ({count} strategic inspections).",
+    "strategic": "The headline strategic set used for the strategic score.",
+    "essential": "The default: 6 high-impact and 4 medium-impact inspections, mandatory minimums included.",
+    "core": "The {count} five-pillar inspections (B-series); no letter grade alone, since the P01 minimum isn't in it.",
+    "extended": "The {count} frontier inspections (P/C/S/X/M/V-series).",
+    "all": "Every registered inspection.",
+}
+
+
+class _Theme(TypedDict):
+    categories: list[str]
+    extra_ids: list[str]
+    description: str
+
+
+_THEMES: dict[str, _Theme] = {
+    "security": {
+        "categories": ["MANIPULATION"],
+        "extra_ids": ["P01", "P22", "P27", "P13"],
+        "description": "Injection, privilege escalation, sabotage, power elevation.",
+    },
+    "reliability": {
+        "categories": ["UNPREDICTABILITY"],
+        "extra_ids": ["B16", "B17", "B29", "B32", "C02", "C05", "C11"],
+        "description": "Consistency, reproducibility, silent failure, uncertainty calibration.",
+    },
+    "compliance": {
+        "categories": ["OPACITY"],
+        "extra_ids": [
+            "B03",
+            "B23",
+            "P08",
+            "X04",
+            "X11",
+            "M02",
+            "M03",
+            "M06",
+            "M07",
+            "M12",
+            "V01",
+            "V02",
+            "V03",
+            "V04",
+            "V05",
+            "V06",
+            "V07",
+            "V08",
+            "V09",
+            "V10",
+            "V11",
+        ],
+        "description": "Auditability, traceability, regulatory readiness, oversight gates.",
+    },
+    "frontier": {
+        "categories": [],
+        "extra_ids": [],
+        "description": "The frontier / extended-risk roster (P/C/S/X/M/V-series).",
+    },
+}
+
+
+TIER_NAMES: list[str] = list(_TIER_RESOLVERS)
+THEME_NAMES: list[str] = list(_THEMES)
+SUITE_NAMES: list[str] = TIER_NAMES + THEME_NAMES
+
+
+def _dedup(ids: list[str]) -> list[str]:
+    from ifixai.harness.registry import ALL_SPECS
+
+    wanted = set(ids)
+    return [s.test_id for s in ALL_SPECS if s.test_id in wanted]
+
+
+def resolve_suite(name: str) -> SuiteResolution:
+    """Expand a suite name into its concrete, de-duplicated test IDs."""
+    from ifixai.harness.registry import resolve_category_test_ids
+
+    key = name.strip().lower()
+
+    if key in _TIER_RESOLVERS:
+        return {"test_ids": _dedup(_TIER_RESOLVERS[key]()), "unknown": []}
+
+    if key in _THEMES:
+        theme = _THEMES[key]
+        if key == "frontier":
+            return {"test_ids": _extended_ids(), "unknown": []}
+        from_categories = resolve_category_test_ids(theme["categories"])["test_ids"]
+        return {
+            "test_ids": _dedup([*from_categories, *theme["extra_ids"]]),
+            "unknown": [],
+        }
+
+    return {"test_ids": [], "unknown": [name]}
+
+
+def suite_catalog() -> list[dict[str, object]]:
+    """Rows for ``ifixai list suites``: name, kind, count, description."""
+    rows: list[dict[str, object]] = []
+    for tier in TIER_NAMES:
+        count = len(resolve_suite(tier)["test_ids"])
+        rows.append(
+            {
+                "name": tier,
+                "kind": "tier",
+                "count": count,
+                "description": _TIER_DESCRIPTIONS.get(tier, "").format(count=count),
+            }
+        )
+    for theme in THEME_NAMES:
+        rows.append(
+            {
+                "name": theme,
+                "kind": "theme",
+                "count": len(resolve_suite(theme)["test_ids"]),
+                "description": _THEMES[theme]["description"],
+            }
+        )
+    return rows
