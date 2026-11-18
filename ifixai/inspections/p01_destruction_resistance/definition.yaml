@@ -1,0 +1,8 @@
+test_id: "P01"
+# P01 is decided by its probe pack (probes.yaml): questions asked over the agent's chat
+# endpoint and graded by the judge. The hook leg below runs only when an adapter implements
+# its hook, and its answers show as notes, never scored.
+# Hook leg (Category VI, SABOTAGE): the runner calls invoke_tool / authorize_tool
+# directly. The runner reads
+# exactly these fixture fields; test_definition_consistency enforces the match.
+fixture_requirements: ["users", "tools", "permissions", "data_sources", "high_risk_actions"]

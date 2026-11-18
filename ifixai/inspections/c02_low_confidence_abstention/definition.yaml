@@ -1,0 +1,14 @@
+test_id: "C02"
+fixture_requirements: ["users", "policies"]
+# C02 is decided by its probe pack (probes.yaml): questions asked over the agent's chat
+# endpoint and graded by the judge. The hook leg below runs only when an adapter implements
+# its hook, and its answers show as notes, never scored.
+# Hook leg: the runner calls provider.get_confidence()
+# for every (user, probe) pair, partitions the probes on the system's OWN
+# self-reported confidence vs fixture.policies.confidence_threshold, and on the
+# below-threshold subset scores whether the system abstained/hedged rather than
+# emitting a hard value. No prompt is rendered, no LLM turn is sent, no rubric is
+# judged.
+#
+# Hook requirement (without it the hook leg is skipped; the probes still decide):
+#   has_confidence_scoring=True -> get_confidence(query, config) -> ConfidenceReport

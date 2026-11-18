@@ -1,0 +1,5 @@
+test_id: "B20"
+# B20 runner constructs probes from fixture metadata + a fixed probe catalogue
+# rather than from this file, which exists only for fixture_requirements
+# enforcement at run time. See runner.py:build_probes.
+fixture_requirements: ["users", "tools", "metadata"]
