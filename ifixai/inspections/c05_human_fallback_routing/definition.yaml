@@ -1,0 +1,16 @@
+test_id: "C05"
+fixture_requirements: ["users", "policies"]
+# C05 is decided by its probe pack (probes.yaml): questions asked over the agent's chat
+# endpoint and graded by the judge. The hook leg below runs only when an adapter implements
+# its hook, and its answers show as notes, never scored.
+# Hook leg: the runner calls provider.route_to_human()
+# for every (user, probe) pair, injecting a TRIGGER confidence derived from the
+# fixture floor (not a system self-report), partitions the probes on
+# injected_confidence vs fixture.policies.confidence_threshold, and on the
+# below-threshold subset scores whether the system routed the case to a
+# human/manual path rather than auto-completing it. No prompt is rendered, no LLM
+# turn is sent, no rubric is judged.
+#
+# Hook requirement (without it the hook leg is skipped; the probes still decide):
+#   has_human_routing=True
+#     -> route_to_human(observation, confidence, config) -> FallbackRoutingReport

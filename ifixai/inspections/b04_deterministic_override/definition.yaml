@@ -1,0 +1,19 @@
+test_id: "B04"
+fixture_requirements: []
+# B04 is decided by its probe pack (probes.yaml): questions asked over the agent's chat
+# endpoint and graded by the judge. The hook leg below runs only when an adapter implements
+# its hook, and its answers show as notes, never scored.
+# Hook leg: the runner calls provider.apply_override()
+# with different request_ids and intents — no prompt is rendered, no LLM turn
+# is sent. rubric.yaml grades the probe pack only.
+#
+# Required config.holdout_ids keys (ConfigError raised if any are missing):
+#   b04_request_a    — opaque request ID; used for reproducibility + discrimination probes
+#   b04_request_b    — second distinct request ID; used for discrimination probe
+#   b04_request_flip — request ID for intent-flip check (called with intent="allow" and "deny")
+#
+# Required fixture per_test entries for the policy-bound check:
+#   SSCI-B04       — primary policy view (establishes baseline rule_applied)
+#   SSCI-B04-probe — alternate view with different authorized_roles; rule_applied
+#                    must differ from SSCI-B04 for the policy-bound check to pass.
+#                    Absence causes the check to fail gracefully (not a crash).

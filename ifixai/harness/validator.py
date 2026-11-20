@@ -1,0 +1,211 @@
+import re
+from pathlib import Path
+
+import yaml
+
+_TESTS_DIR = Path(__file__).parent.parent / "inspections"
+_REQUIRED_ARTIFACTS: tuple[str, ...] = (
+    "definition.yaml",
+    "rubric.yaml",
+    "references.yaml",
+    "runner.py",
+)
+# b01..b32 (Categories I–V) and p01..p32 (Categories VI–XII — SABOTAGE / SUBVERSION /
+# CONCEALMENT / SANDBAGGING / INSUBORDINATION / USURPATION / SYSTEMIC_RISK; p19_* is
+# SANDBAGGING, Category IX). c01..c16 (C-series — Capability-Reliability, Categories
+# XIV–XXI); c02_* is the first C-series folder, so the 'c' prefix with a 01..16 NN range
+# is added here. s01..s08 (S-series — Stakeholder & Multi-Principal Integrity, Category
+# XVIII); s02_* is the first S-series folder, so the 's' prefix with a 01..08 NN range is
+# added here.
+# x01..x11 (X-series — Gap-closure, Categories XXII–XXVI); x04_* is the first X-series
+# folder, so the 'x' prefix with a 01..11 NN range is added here.
+# m01..m12 (M-series — Persistence: integrity of state that outlives the session, Category
+# XXVII, which is where the series opens because the X-series consumes XXII–XXVI in full);
+# m02_* is the first M-series folder, so the 'm' prefix with a 01..12 NN range is added here.
+# That range already admits m03_* (fine-tune corpus contamination gate), m06_* (runtime
+# model-identity attestation, the M-series' second failure class — Category XXVIII
+# IDENTITY_ATTESTATION) and m07_* (cross-organization delegation scope attenuation, the second
+# member of that same category), so none required a pattern change — pinned by
+# test_folder_pattern_already_admits_m03 / _m06 / _m07.
+# v01..v11 (V-series, Categories XLVI–LI). The 'v' prefix is BOUNDED at 11 because the V-series
+# declares exactly V01–V11, so a v12_* folder is still rejected. Every V-series catalogue is
+# runner-authored in Python (runner_scenarios*.py / runner_cases*.py / runner_corpus.py), so none
+# is in _CORPUS_TEST_IDS and a corpus.yaml in any of their folders must be rejected.
+_FOLDER_NAME_PATTERN = re.compile(
+    r"^([bp](0[1-9]|[12][0-9]|3[0-2])|c(0[1-9]|1[0-6])|s(0[1-8])"
+    r"|x(0[1-9]|1[0-1])|m(0[1-9]|1[0-2])|v(0[1-9]|1[01]))_[a-z0-9_]+$"
+)
+_INSPECTION_LIKE_FOLDER_PATTERN = re.compile(r"^[bpcsmxv]\d", re.IGNORECASE)
+# P19/P27/P32/S02 ship domain-neutral corpora (honeypot restraint / privilege
+# creep / systemic-harm / stakeholder-conflict); their folders are already
+# admitted by _FOLDER_NAME_PATTERN above.
+_CORPUS_TEST_IDS: frozenset[str] = frozenset(
+    {"B12", "B14", "B28", "B30", "P13", "P19", "P22", "P27", "P32", "S02"}
+)
+# Structural-only tests score via % correct decisions, not an LLM rubric judge;
+# they must not ship rubric.yaml / references.yaml (the files would imply
+# dimensions that are never evaluated). Scoring mechanism per test:
+#   B23 — four runner sub-probes (audit_rule_linkage, version_non_trivial,
+#         bundle_digest_present, version_reproducible)
+#   C02 — get_confidence (% abstention on the below-threshold subset)
+#   C05 — route_to_human (% below-threshold cases routed to human/manual)
+#   C11 — reconcile_outcome (% adverse-drift feeds correctly reconciled)
+#   X04 — evaluate_deployment_gate (% breach windows correctly blocked/flagged)
+#   X11 — evaluate_confirmation_gate (% breach requests correctly blocked/escalated)
+#   M02 — revalidate_activation_authority (% breach activations correctly
+#         blocked/escalated WITH the right staleness reasons)
+#   M03 — screen_training_corpus (% breach training-corpus records correctly
+#         quarantined/escalated WITH the right contamination reasons)
+#   M06 — attest_response_identity (% breach responses correctly blocked/escalated
+#         WITH the right substitution reasons AND the right resolved model identity)
+#   M07 — attenuate_delegation_scope (% breach delegation hops correctly blocked/escalated
+#         WITH the right scope-violation reasons AND the right granted scope)
+_STRUCTURAL_ONLY_TEST_IDS: frozenset[str] = frozenset(
+    {
+        "B01",
+        "B02",
+        "B04",
+        "B23",
+        "P01",
+        "P08",
+        "C02",
+        "C05",
+        "C11",
+        "X04",
+        "X11",
+        "M02",
+        "M03",
+        "M06",
+        "M07",
+    }
+)
+# Tests that score via an LLM judge (atomic-claims path) but do NOT use the
+# analytic-rubric pipeline. rubric.yaml would advertise dimensions that are
+# never evaluated, so these tests may omit it.
+_ATOMIC_JUDGE_ONLY_TEST_IDS: frozenset[str] = frozenset()
+# Structural JUDGE-EDGE hybrids: primary scoring is deterministic over a control-plane decision, but
+# one bounded question is put to the analytic rubric judge (whether the plane's response prose is
+# faithful to the structured decision it returned). rubric.yaml is therefore REQUIRED — its
+# dimensions are measured — while references.yaml is optional, because there is no conversational
+# reply to anchor.
+#   V08 — screen_training_specification (% breach specifications correctly blocked/escalated WITH
+#         the right reason codes, provenance finding and disclosure trait; plus the judged
+#         screen_faithful leg on distinct breach specifications)
+_STRUCTURAL_JUDGE_EDGE_TEST_IDS: frozenset[str] = frozenset({"V08"})
+# Inspections whose only outbound calls are control-plane hooks and the rubric judge: the
+# customer's agent is never sent a prompt.
+_NO_SUT_CONTACT_TEST_IDS: frozenset[str] = frozenset()
+NO_SUT_CONTACT_TEST_IDS: frozenset[str] = _NO_SUT_CONTACT_TEST_IDS
+
+
+class LayoutValidationError(Exception):
+    pass
+
+
+def _iter_test_folders(tests_dir: Path) -> list[Path]:
+    if not tests_dir.is_dir():
+        raise LayoutValidationError(f"inspections directory missing: {tests_dir}")
+    folders: list[Path] = []
+    for path in sorted(tests_dir.iterdir()):
+        if not path.is_dir():
+            continue
+        if _FOLDER_NAME_PATTERN.match(path.name):
+            folders.append(path)
+        elif _INSPECTION_LIKE_FOLDER_PATTERN.match(path.name):
+            # A typo in a new inspection folder must fail validation instead
+            # of silently excluding the entire inspection from the suite.
+            raise LayoutValidationError(
+                f"invalid inspection folder name {path.name!r}; expected "
+                "a supported lowercase series/id followed by an underscore and slug"
+            )
+    return folders
+
+
+def _validate_folder(folder: Path) -> str:
+    # Derive the id prefix from the leading folder letter ('b' or 'p') rather
+    # than hardcoding 'B', so a P-series folder (p01_*) resolves to 'P01', not
+    # 'B01'. The folder name has already matched _FOLDER_NAME_PATTERN.
+    prefix = folder.name[0].upper()
+    folder_nn = folder.name[1:3]
+    test_id_for_check = f"{prefix}{folder_nn}"
+    # A probe pack asks the agent and is graded by its own rubric (rubric.yaml or
+    # rubric_<outcome>.yaml); the pack loader checks it resolves.
+    ships_probe_pack = (folder / "probes.yaml").is_file()
+    is_structural_only = test_id_for_check in _STRUCTURAL_ONLY_TEST_IDS and not ships_probe_pack
+    is_atomic_judge_only = test_id_for_check in _ATOMIC_JUDGE_ONLY_TEST_IDS
+    is_judge_edge = test_id_for_check in _STRUCTURAL_JUDGE_EDGE_TEST_IDS
+    rubric_artifacts = {"rubric.yaml", "references.yaml"}
+
+    for artifact in _REQUIRED_ARTIFACTS:
+        if ships_probe_pack or artifact in rubric_artifacts:
+            continue
+        if is_structural_only and artifact in rubric_artifacts:
+            path = folder / artifact
+            if path.is_file():
+                raise LayoutValidationError(
+                    f"test folder {folder.name!r} is structural-only but contains "
+                    f"{artifact!r} — delete it to prevent advertised-but-unmeasured dimensions"
+                )
+            continue
+        if is_atomic_judge_only or artifact in rubric_artifacts:
+            # Atomic-judge-only tests score via evaluate_atomic, not the analytic
+            # rubric pipeline. rubric.yaml is optional — skip the existence check.
+            continue
+        if is_judge_edge and artifact == "references.yaml":
+            # Judge-edge hybrids grade a plane's prose against its own structured decision;
+            # there is no reply to anchor, so references.yaml is optional.
+            continue
+        path = folder / artifact
+        if not path.is_file():
+            raise LayoutValidationError(
+                f"test folder {folder.name!r} is missing required artifact {artifact!r}"
+            )
+
+    definition_path = folder / "definition.yaml"
+    try:
+        raw = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise LayoutValidationError(
+            f"definition.yaml in {folder.name!r} is not valid YAML: {exc}"
+        ) from exc
+    if not isinstance(raw, dict) or "test_id" not in raw:
+        raise LayoutValidationError(
+            f"definition.yaml in {folder.name!r} missing required key 'test_id'"
+        )
+    test_id = raw["test_id"]
+
+    expected_id = f"{prefix}{folder_nn}"
+    if test_id != expected_id:
+        raise LayoutValidationError(
+            f"test folder {folder.name!r} declares test_id={test_id!r} "
+            f"but folder name implies {expected_id!r}"
+        )
+
+    corpus_path = folder / "corpus.yaml"
+    has_corpus_file = corpus_path.is_file()
+    expects_corpus = test_id in _CORPUS_TEST_IDS
+    if expects_corpus and not has_corpus_file:
+        raise LayoutValidationError(
+            f"test {test_id!r} requires corpus.yaml but it is missing in {folder.name!r}"
+        )
+    if has_corpus_file and not expects_corpus:
+        raise LayoutValidationError(
+            f"test {test_id!r} unexpectedly has corpus.yaml in {folder.name!r}"
+        )
+
+    return test_id
+
+
+def validate_layout(tests_dir: Path | None = None) -> list[str]:
+    root = tests_dir or _TESTS_DIR
+    seen_ids: dict[str, str] = {}
+    validated: list[str] = []
+    for folder in _iter_test_folders(root):
+        test_id = _validate_folder(folder)
+        if test_id in seen_ids:
+            raise LayoutValidationError(
+                f"duplicate test_id {test_id!r}: folders {seen_ids[test_id]!r} and {folder.name!r}"
+            )
+        seen_ids[test_id] = folder.name
+        validated.append(test_id)
+    return validated

@@ -1,0 +1,8 @@
+test_id: "B23"
+fixture_requirements: ["policies", "regulations", "tools"]
+# B23 is decided by its probe pack (probes.yaml): questions asked over the agent's chat
+# endpoint and graded by the judge. The hook leg below runs only when an adapter implements
+# its hook, and its answers show as notes, never scored.
+# Hook leg: `get_audit_trail` and `get_configuration_version`. Both legs answer EU AI Act Art. 12 / 17
+# record-keeping and traceability: every decision must reference a versioned
+# policy whose bundle can be pinned via a reproducible digest.
